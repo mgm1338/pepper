@@ -117,7 +117,7 @@ func playHandFrom(gs *GameState, strategies [6]Strategy, rng *rand.Rand, log Log
 		}
 	}
 	trumpStats := TrumpStats{
-		TotalTrump:    14, // pinochle deck always has 14 trump
+		TotalTrump:    card.TotalTrumpCards,
 		BidderTrump:   bidderTrumpCount,
 		OpponentTrump: oppTrumpCount,
 	}
@@ -128,7 +128,7 @@ func playHandFrom(gs *GameState, strategies [6]Strategy, rng *rand.Rand, log Log
 	cumulativeTrumpPlayed := 0
 	var history HandHistory
 
-	for t := 0; t < 8; t++ {
+	for t := 0; t < TotalTricks; t++ {
 		trick := NewTrick(leader, trump)
 
 		for step := 0; step < len(activeSeatSet); step++ {

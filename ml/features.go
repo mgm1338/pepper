@@ -114,7 +114,7 @@ func ExtractContext(seat int, hand []card.Card, state game.TrickState, activePla
 
 	// --- Trick progress (4–9) ---
 	trickNum := state.TrickNumber
-	f[i] = float32(trickNum) / 7.0
+	f[i] = float32(trickNum) / (game.TotalTricks - 1)
 	i++ // trick_number
 
 	myTeam := game.TeamOf(seat)
@@ -133,29 +133,29 @@ func ExtractContext(seat int, hand []card.Card, state game.TrickState, activePla
 			defTeamTricks += t
 		}
 	}
-	f[i] = float32(trickUs) / 8.0
+	f[i] = float32(trickUs) / game.TotalTricks
 	i++ // tricks_taken_us
-	f[i] = float32(tricksThem) / 8.0
+	f[i] = float32(tricksThem) / game.TotalTricks
 	i++ // tricks_taken_them
 
 	bidAmount := state.BidAmount
-	if bidAmount > 8 {
-		bidAmount = 8 // pepper → treat as 8
+	if bidAmount > game.TotalTricks {
+		bidAmount = game.TotalTricks // pepper → treat as 8
 	}
 	needed := bidAmount - bidTeamTricks
 	if needed < 0 {
 		needed = 0
 	}
-	f[i] = float32(needed) / 8.0
+	f[i] = float32(needed) / game.TotalTricks
 	i++ // tricks_needed_us
 
-	toEuchre := (8 - bidAmount + 1) - defTeamTricks
+	toEuchre := (game.TotalTricks - bidAmount + 1) - defTeamTricks
 	if toEuchre < 0 {
 		toEuchre = 0
 	}
-	f[i] = float32(toEuchre) / 8.0
+	f[i] = float32(toEuchre) / game.TotalTricks
 	i++ // tricks_to_euchre
-	f[i] = float32(8-trickNum) / 8.0
+	f[i] = float32(game.TotalTricks-trickNum) / game.TotalTricks
 	i++ // tricks_remaining
 
 	// --- Current trick context (10–15) ---
@@ -203,19 +203,19 @@ func ExtractContext(seat int, hand []card.Card, state game.TrickState, activePla
 
 	// --- My hand composition (16–23) ---
 	var trumpCount, rightBowerCount, leftBowerCount int
-	highestTrumpRank := -1
+	highestTrumpRank := card.TrumpRankNone
 	var offAces, voids, singletons int
 	suitCounts := [4]int{}
 
 	for _, c := range hand {
-		if card.TrumpRank(c, trump) >= 0 {
+		rank := card.TrumpRank(c, trump)
+		if rank >= 0 {
 			trumpCount++
 			if card.IsRightBower(c, trump) {
 				rightBowerCount++
 			} else if card.IsLeftBower(c, trump) {
 				leftBowerCount++
 			}
-			rank := card.TrumpRank(c, trump)
 			if rank > highestTrumpRank {
 				highestTrumpRank = rank
 			}
@@ -244,7 +244,7 @@ func ExtractContext(seat int, hand []card.Card, state game.TrickState, activePla
 		}
 	}
 
-	f[i] = float32(trumpCount) / 14.0
+	f[i] = float32(trumpCount) / card.TotalTrumpCards
 	i++ // trump_in_hand
 	if rightBowerCount > 0 {
 		f[i] = 1.0
@@ -255,24 +255,24 @@ func ExtractContext(seat int, hand []card.Card, state game.TrickState, activePla
 	}
 	i++ // has_left
 	if highestTrumpRank >= 0 {
-		f[i] = float32(highestTrumpRank) / 13.0
+		f[i] = float32(highestTrumpRank) / card.TrumpRankRight
 	}
 	i++ // highest_trump_rank
-	f[i] = float32(offAces) / 6.0
+	f[i] = float32(offAces) / card.NonTrumpRankAce
 	i++ // off_suit_aces
 	f[i] = float32(voids) / 3.0
 	i++ // void_suits
 	f[i] = float32(singletons) / 3.0
 	i++ // singleton_suits
-	f[i] = float32(len(hand)) / 8.0
+	f[i] = float32(len(hand)) / game.TotalTricks
 	i++ // cards_in_hand
 
 	// --- Trump field knowledge (24–28) ---
 	h := state.History
 	trumpRemaining := h.TrumpRemaining(trump)
-	f[i] = float32(trumpRemaining) / 14.0
+	f[i] = float32(trumpRemaining) / card.TotalTrumpCards
 	i++ // trump_remaining
-	f[i] = float32(h.TrumpPlayed(trump)) / 14.0
+	f[i] = float32(h.TrumpPlayed(trump)) / card.TotalTrumpCards
 	i++ // trump_played
 	f[i] = float32(h.RightBowersPlayed(trump)) / 2.0
 	i++ // right_bowers_played
@@ -295,19 +295,19 @@ func ExtractContext(seat int, hand []card.Card, state game.TrickState, activePla
 	scores := state.Scores
 	myScore := scores[myTeam]
 	themScore := scores[1-myTeam]
-	f[i] = float32(myScore) / 64.0
+	f[i] = float32(myScore) / game.WinScore
 	i++ // score_us
-	f[i] = float32(themScore) / 64.0
+	f[i] = float32(themScore) / game.WinScore
 	i++ // score_them
-	f[i] = float32(myScore-themScore) / 64.0
+	f[i] = float32(myScore-themScore) / game.WinScore
 	i++ // score_gap
-	if myScore >= 48 || themScore >= 48 {
+	if myScore >= game.CloseoutScore || themScore >= game.CloseoutScore {
 		f[i] = 1.0
 	}
 	i++ // closeout_window
 
 	// --- Bid context (33) ---
-	f[i] = float32(bidAmount) / 8.0
+	f[i] = float32(bidAmount) / game.TotalTricks
 	i++ // bid_amount_norm
 
 	// --- Trump dominance (34–36) ---
@@ -320,7 +320,7 @@ func ExtractContext(seat int, hand []card.Card, state game.TrickState, activePla
 	if oppTrump < 0 {
 		oppTrump = 0
 	}
-	f[i] = float32(oppTrump) / 14.0
+	f[i] = float32(oppTrump) / card.TotalTrumpCards
 	i++ // opp_trump_est
 
 	if cardsInTrick > 0 && remaining == 0 {
@@ -348,9 +348,9 @@ func AppendCard(ctx [ContextFeatureLen]float32, c card.Card, trump card.Suit, ha
 	i++ // card_is_trump
 
 	if isTrump {
-		f[i] = float32(card.TrumpRank(c, trump)) / 13.0
+		f[i] = float32(card.TrumpRank(c, trump)) / card.TrumpRankRight
 	} else {
-		f[i] = float32(card.NonTrumpRank(c)) / 6.0
+		f[i] = float32(card.NonTrumpRank(c)) / card.NonTrumpRankAce
 	}
 	i++ // card_rank_norm
 

@@ -122,7 +122,7 @@ func BidContext(seat int, hand []card.Card, dealer int, currentHigh int, scores 
 	}
 
 	// Hand composition features.
-	f[i] = float32(best.count) / 14.0
+	f[i] = float32(best.count) / card.TotalTrumpCards
 	i++ // best_trump_count
 	if best.hasRight {
 		f[i] = 1.0
@@ -133,10 +133,10 @@ func BidContext(seat int, hand []card.Card, dealer int, currentHigh int, scores 
 	}
 	i++ // best_has_left
 	if best.bestRank >= 0 {
-		f[i] = float32(best.bestRank) / 13.0
+		f[i] = float32(best.bestRank) / card.TrumpRankRight
 	}
 	i++ // best_trump_rank
-	f[i] = float32(offAces) / 6.0
+	f[i] = float32(offAces) / card.NonTrumpRankAce
 	i++ // best_off_aces
 	f[i] = float32(voids) / 3.0
 	i++ // best_void_suits
@@ -147,9 +147,9 @@ func BidContext(seat int, hand []card.Card, dealer int, currentHigh int, scores 
 	if dominance < 0 {
 		dominance = 0
 	}
-	f[i] = float32(dominance) / 14.0
+	f[i] = float32(dominance) / card.TotalTrumpCards
 	i++ // suit_dominance
-	f[i] = float32(second.count) / 14.0
+	f[i] = float32(second.count) / card.TotalTrumpCards
 	i++ // second_trump_count
 
 	// Position and bidding state.
@@ -180,13 +180,13 @@ func BidContext(seat int, hand []card.Card, dealer int, currentHigh int, scores 
 	myTeam := game.TeamOf(seat)
 	myScore := scores[myTeam]
 	themScore := scores[1-myTeam]
-	f[i] = float32(myScore) / 64.0
+	f[i] = float32(myScore) / game.WinScore
 	i++ // score_us
-	f[i] = float32(themScore) / 64.0
+	f[i] = float32(themScore) / game.WinScore
 	i++ // score_them
-	f[i] = float32(myScore-themScore) / 64.0
+	f[i] = float32(myScore-themScore) / game.WinScore
 	i++ // score_gap
-	if myScore >= 48 || themScore >= 48 {
+	if myScore >= game.CloseoutScore || themScore >= game.CloseoutScore {
 		f[i] = 1.0
 	}
 	i++ // closeout_window
@@ -202,7 +202,7 @@ func AppendBidAction(ctx [BidContextLen]float32, bidLevel int) [BidTotalLen]floa
 	copy(f[:BidContextLen], ctx[:])
 
 	i := BidContextLen
-	f[i] = float32(bidLevel) / 8.0
+	f[i] = float32(bidLevel) / game.TotalTricks
 	i++ // bid_level_norm
 	if bidLevel == game.PassBid {
 		f[i] = 1.0

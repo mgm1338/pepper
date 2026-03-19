@@ -2,10 +2,10 @@
 *.csv
 iters/
 
-# Compiled binaries
-collect
-simulate
-botserver
+# Compiled binaries (anchored to root so cmd/ subdirs are not excluded)
+/collect
+/simulate
+/botserver
 
 # Logs
 *.log

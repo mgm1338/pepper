@@ -51,13 +51,13 @@ func ScoreHand(
 		callerTricks := tricksByTeam[bidderTeam]
 		oppTricks := tricksByTeam[otherTeam]
 
-		if callerTricks == 8 {
+		if callerTricks == TotalTricks {
 			// Perfect pepper: +16 for caller, opponents score 0.
-			result.ScoreDelta[bidderTeam] = 16
+			result.ScoreDelta[bidderTeam] = PepperPoints
 			result.MadeBid = true
 		} else {
 			// Missed pepper: caller -16, opponents +2 per trick they took.
-			result.ScoreDelta[bidderTeam] = -16
+			result.ScoreDelta[bidderTeam] = -PepperPoints
 			result.ScoreDelta[otherTeam] = oppTricks * 2
 			result.MadeBid = false
 		}

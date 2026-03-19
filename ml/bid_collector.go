@@ -121,7 +121,7 @@ func (dp bidPoint) playHand(
 	leader := callerSeat
 	var history game.HandHistory
 
-	for t := 0; t < 8; t++ {
+	for t := 0; t < game.TotalTricks; t++ {
 		trick := game.NewTrick(leader, trump)
 		for step := 0; step < len(activeSeats); step++ {
 			seat := activeSeats[(indexInSlice(activeSeats, leader)+step)%len(activeSeats)]

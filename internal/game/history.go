@@ -2,6 +2,16 @@ package game
 
 import "github.com/max/pepper/internal/card"
 
+// cachedTrumpCards holds pre-computed trump card lists for each suit, indexed by Suit value.
+// Built once at init to avoid repeated allocations in IsTopTrump.
+var cachedTrumpCards [4][]card.Card
+
+func init() {
+	for s := card.Suit(0); s < 4; s++ {
+		cachedTrumpCards[s] = buildTrumpCards(s)
+	}
+}
+
 // HandHistory tracks all cards played in completed tricks this hand.
 // Passed to every strategy call so bots can reason about what is still live.
 type HandHistory struct {
@@ -64,10 +74,8 @@ func (h *HandHistory) TrumpPlayed(trump card.Suit) int {
 }
 
 // TrumpRemaining returns how many trump cards have NOT been played yet.
-// Total trump in a pinochle deck = 14 (2 right bowers + 2 left bowers + 2 each of A,K,Q,10,9).
 func (h *HandHistory) TrumpRemaining(trump card.Suit) int {
-	const totalTrump = 14
-	return totalTrump - h.TrumpPlayed(trump)
+	return card.TotalTrumpCards - h.TrumpPlayed(trump)
 }
 
 // IsTopTrump returns true if c is the highest unplayed trump card.
@@ -78,8 +86,7 @@ func (h *HandHistory) IsTopTrump(c card.Card, trump card.Suit) bool {
 		return false
 	}
 	// Check if any higher-ranked trump card is still unplayed.
-	allTrump := allTrumpCards(trump)
-	for _, t := range allTrump {
+	for _, t := range cachedTrumpCards[trump] {
 		if card.TrumpRank(t, trump) > myRank && !h.IsSeen(t) {
 			return false
 		}
@@ -100,10 +107,11 @@ func (h *HandHistory) CardsPlayedInSuit(suit card.Suit, trump card.Suit) int {
 	return n
 }
 
-// allTrumpCards returns all 14 trump cards for a given trump suit.
-func allTrumpCards(trump card.Suit) []card.Card {
+// buildTrumpCards constructs the full list of 14 trump cards for a given trump suit.
+// Called once per suit at init time; use cachedTrumpCards for lookups.
+func buildTrumpCards(trump card.Suit) []card.Card {
 	partner := card.PartnerSuit(trump)
-	var cards []card.Card
+	cards := make([]card.Card, 0, card.TotalTrumpCards)
 	// Right bowers (J of trump, copies 0 and 1).
 	cards = append(cards, card.Card{Suit: trump, Rank: card.Jack, CopyIndex: 0})
 	cards = append(cards, card.Card{Suit: trump, Rank: card.Jack, CopyIndex: 1})

@@ -1,5 +1,17 @@
 package game
 
+// WinScore is the score a team must reach to win the game.
+const WinScore = 64
+
+// TotalTricks is the number of tricks played per hand.
+const TotalTricks = 8
+
+// PepperPoints is the score swing for a pepper call: +16 if made, -16 if missed.
+const PepperPoints = 16
+
+// CloseoutScore is the score at which a team is within one pepper call of winning.
+const CloseoutScore = WinScore - PepperPoints // 48
+
 // TeamIndex identifies one of the two teams.
 // Team 0 = seats 0, 2, 4
 // Team 1 = seats 1, 3, 5
@@ -52,18 +64,18 @@ func (g *GameState) IsOver() (bool, TeamIndex) {
 	s0, s1 := g.Scores[0], g.Scores[1]
 
 	// Normal win: reach 64
-	if s0 >= 64 && s1 >= 0 {
+	if s0 >= WinScore && s1 >= 0 {
 		return true, Team0
 	}
-	if s1 >= 64 && s0 >= 0 {
+	if s1 >= WinScore && s0 >= 0 {
 		return true, Team1
 	}
 
 	// Blowout win: lead opponent by 64 when opponent is negative
-	if s1 < 0 && s0-s1 >= 64 {
+	if s1 < 0 && s0-s1 >= WinScore {
 		return true, Team0
 	}
-	if s0 < 0 && s1-s0 >= 64 {
+	if s0 < 0 && s1-s0 >= WinScore {
 		return true, Team1
 	}
 

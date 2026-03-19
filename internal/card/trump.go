@@ -1,5 +1,31 @@
 package card
 
+// TotalTrumpCards is the number of trump cards in a pinochle deck for any suit.
+// Includes 2 right bowers, 2 left bowers, and 2 each of A, K, Q, 10, 9.
+const TotalTrumpCards = 14
+
+// Trump rank values (higher = stronger). Non-trump returns TrumpRankNone.
+const (
+	TrumpRankNone  = -1
+	TrumpRankNine  = 1
+	TrumpRankTen   = 3
+	TrumpRankQueen = 5
+	TrumpRankKing  = 7
+	TrumpRankAce   = 9
+	TrumpRankLeft  = 11
+	TrumpRankRight = 13
+)
+
+// Non-trump rank values within a suit (higher = stronger).
+const (
+	NonTrumpRankNine  = 1
+	NonTrumpRankTen   = 2
+	NonTrumpRankJack  = 3
+	NonTrumpRankQueen = 4
+	NonTrumpRankKing  = 5
+	NonTrumpRankAce   = 6
+)
+
 // EffectiveSuit returns the suit a card belongs to for trick-following purposes.
 // A left bower (Jack of the partner suit) counts as trump, not its printed suit.
 func EffectiveSuit(c Card, trump Suit) Suit {
@@ -20,33 +46,33 @@ func IsLeftBower(c Card, trump Suit) bool {
 }
 
 // TrumpRank returns a numeric rank for a trump card (higher = stronger).
-// Non-trump cards return -1.
+// Non-trump cards return TrumpRankNone (-1).
 // Ranking: right bower (13), left bower (11), A (9), K (7), Q (5), 10 (3), 9 (1).
 // The two copies of each share the same base value; the trick engine uses play
 // order to break ties between identical cards.
 func TrumpRank(c Card, trump Suit) int {
 	if IsRightBower(c, trump) {
-		return 13
+		return TrumpRankRight
 	}
 	if IsLeftBower(c, trump) {
-		return 11
+		return TrumpRankLeft
 	}
 	if EffectiveSuit(c, trump) != trump {
-		return -1 // not a trump card
+		return TrumpRankNone
 	}
 	switch c.Rank {
 	case Ace:
-		return 9
+		return TrumpRankAce
 	case King:
-		return 7
+		return TrumpRankKing
 	case Queen:
-		return 5
+		return TrumpRankQueen
 	case Ten:
-		return 3
+		return TrumpRankTen
 	case Nine:
-		return 1
+		return TrumpRankNine
 	}
-	return -1
+	return TrumpRankNone
 }
 
 // NonTrumpRank returns a numeric rank for a non-trump card within its suit.
@@ -54,17 +80,17 @@ func TrumpRank(c Card, trump Suit) int {
 func NonTrumpRank(c Card) int {
 	switch c.Rank {
 	case Ace:
-		return 6
+		return NonTrumpRankAce
 	case King:
-		return 5
+		return NonTrumpRankKing
 	case Queen:
-		return 4
+		return NonTrumpRankQueen
 	case Jack:
-		return 3
+		return NonTrumpRankJack
 	case Ten:
-		return 2
+		return NonTrumpRankTen
 	case Nine:
-		return 1
+		return NonTrumpRankNine
 	}
 	return 0
 }

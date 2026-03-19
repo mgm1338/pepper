@@ -97,7 +97,7 @@ func (dp decisionPoint) rollout(forcedCard card.Card, rolloutStrat [6]game.Strat
 	leader := winner
 
 	// --- Play remaining tricks ---
-	for t := dp.trickNum + 1; t < 8; t++ {
+	for t := dp.trickNum + 1; t < game.TotalTricks; t++ {
 		trick = game.NewTrick(leader, dp.trump)
 
 		for step := 0; step < len(dp.activeSeats); step++ {
@@ -198,7 +198,7 @@ func CollectHand(
 	var history game.HandHistory
 	var rows []CollectRow
 
-	for t := 0; t < 8; t++ {
+	for t := 0; t < game.TotalTricks; t++ {
 		trick := game.NewTrick(leader, trump)
 
 		for step := 0; step < len(activeSeats); step++ {
