@@ -1,0 +1,5 @@
+*.csv
+*.json
+ml/training_data/
+ml/__pycache__/
+ml/*.pyc

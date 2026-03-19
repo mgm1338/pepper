@@ -1,0 +1,20 @@
+# Large training data and results
+*.csv
+iters/
+
+# Compiled binaries
+collect
+simulate
+botserver
+
+# Logs
+*.log
+
+# Model weights (large JSON files at root — keep these)
+# bid_model_weights.json and model_weights.json are small enough to track
+
+# macOS
+.DS_Store
+
+# Claude session data
+.claude/
