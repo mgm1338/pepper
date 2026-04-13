@@ -7,11 +7,12 @@ import (
 
 // Bid feature vector layout:
 //   0–16  context features shared across all bid options at a decision point
-//   17–19 per-bid features appended once per candidate bid level
+//   17–18 opportunity cost features (who holds the high bid)
+//   19–20 per-bid features appended once per candidate bid level
 const (
-	BidContextLen = 17
+	BidContextLen = 19
 	BidActionLen  = 3
-	BidTotalLen   = BidContextLen + BidActionLen // 20
+	BidTotalLen   = BidContextLen + BidActionLen // 22
 )
 
 // BidFeatureNames provides human-readable column names for the full bid feature vector.
@@ -39,18 +40,24 @@ var BidFeatureNames = [BidTotalLen]string{
 	"score_gap",        // (us - them) / 64  (signed)
 	"closeout_window",  // 1 if either team is at 48+ (within 16 of 64)
 
-	// Per-bid features (17–19)
+	// Opportunity cost context (17–18)
+	"high_bid_is_teammate", // 1 if the current high bid is held by a teammate (passing protects them)
+	"seats_left_norm",      // seats remaining to bid after this one / 5 (0 = last to act)
+
+	// Per-bid features (19–21)
 	"bid_level_norm", // bid / 8  (pass=0, 4=0.5, 5=0.625, 6=0.75, 7=0.875, pepper=1.0)
 	"bid_is_pass",    // 1 if this is a pass
 	"bid_is_pepper",  // 1 if this is a pepper call
 }
 
-// BidContext extracts the 17 shared context features for a bid decision.
+// BidContext extracts the 19 shared context features for a bid decision.
 // hand is the bidding player's full 8-card hand.
 // dealer is the dealer seat index, seat is the current bidder's seat index.
 // currentHigh is the current highest bid (0 if no bids yet).
+// highSeat is the seat holding the current high bid (-1 if no bids yet).
+// seatsLeft is the number of seats still to bid after this one.
 // scores is the current game score.
-func BidContext(seat int, hand []card.Card, dealer int, currentHigh int, scores [2]int) [BidContextLen]float32 {
+func BidContext(seat int, hand []card.Card, dealer int, currentHigh int, highSeat int, seatsLeft int, scores [2]int) [BidContextLen]float32 {
 	var f [BidContextLen]float32
 	i := 0
 
@@ -191,6 +198,14 @@ func BidContext(seat int, hand []card.Card, dealer int, currentHigh int, scores 
 	}
 	i++ // closeout_window
 
+	// Opportunity cost features.
+	if highSeat >= 0 && game.TeamOf(highSeat) == game.TeamOf(seat) {
+		f[i] = 1.0
+	}
+	i++ // high_bid_is_teammate
+	f[i] = float32(seatsLeft) / 5.0
+	i++ // seats_left_norm
+
 	_ = i // i == BidContextLen here
 	return f
 }
@@ -217,17 +232,26 @@ func AppendBidAction(ctx [BidContextLen]float32, bidLevel int) [BidTotalLen]floa
 	return f
 }
 
+// validBidTable[currentHigh] returns the candidate bid levels for that high.
+// currentHigh < MinBid (4) all map to the same full set [0,4,5,6,7,8].
+// Slices are shared read-only — callers must not modify.
+var validBidTable = [8][]int{
+	0: {game.PassBid, 4, 5, 6, 7, game.PepperBid},
+	1: {game.PassBid, 4, 5, 6, 7, game.PepperBid},
+	2: {game.PassBid, 4, 5, 6, 7, game.PepperBid},
+	3: {game.PassBid, 4, 5, 6, 7, game.PepperBid},
+	4: {game.PassBid, 5, 6, 7, game.PepperBid},
+	5: {game.PassBid, 6, 7, game.PepperBid},
+	6: {game.PassBid, 7, game.PepperBid},
+	7: {game.PassBid, game.PepperBid},
+}
+
 // ValidBidLevels returns the candidate bid levels for this decision point,
 // including pass (0), all valid overcall levels, and pepper (8).
+// Returns a shared slice — callers must not modify.
 func ValidBidLevels(currentHigh int) []int {
-	levels := []int{game.PassBid} // always can pass
-	min := game.MinBid
-	if currentHigh >= game.MinBid {
-		min = currentHigh + 1
+	if currentHigh < 0 || currentHigh >= len(validBidTable) {
+		currentHigh = 0
 	}
-	for level := min; level <= 7; level++ {
-		levels = append(levels, level)
-	}
-	levels = append(levels, game.PepperBid)
-	return levels
+	return validBidTable[currentHigh]
 }

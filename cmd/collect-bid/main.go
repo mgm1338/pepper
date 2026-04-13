@@ -14,31 +14,97 @@ import (
 	"encoding/csv"
 	"flag"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
 
+	"github.com/max/pepper/internal/card"
 	"github.com/max/pepper/internal/game"
+	"github.com/max/pepper/internal/mlstrategy"
 	"github.com/max/pepper/internal/strategy"
 	"github.com/max/pepper/ml"
 )
 
+// epsilonStrategy wraps any Strategy and plays a uniformly random valid card
+// with probability epsilon, otherwise delegates to the inner strategy.
+// The rng field is the worker's rng, so different rollouts produce different choices.
+type epsilonStrategy struct {
+	inner   game.Strategy
+	epsilon float64
+	rng     *rand.Rand
+}
+
+func (s *epsilonStrategy) Bid(seat int, state game.BidState) int {
+	return s.inner.Bid(seat, state)
+}
+func (s *epsilonStrategy) ChooseTrump(seat int, hand []card.Card) card.Suit {
+	return s.inner.ChooseTrump(seat, hand)
+}
+func (s *epsilonStrategy) GivePepper(seat int, hand []card.Card, trump card.Suit) card.Card {
+	return s.inner.GivePepper(seat, hand, trump)
+}
+func (s *epsilonStrategy) PepperDiscard(seat int, hand []card.Card, trump card.Suit, received [2]card.Card) [2]card.Card {
+	return s.inner.PepperDiscard(seat, hand, trump, received)
+}
+func (s *epsilonStrategy) Play(seat int, validPlays []card.Card, state game.TrickState) card.Card {
+	if len(validPlays) > 1 && s.rng.Float64() < s.epsilon {
+		return validPlays[s.rng.Intn(len(validPlays))]
+	}
+	return s.inner.Play(seat, validPlays, state)
+}
+
 func main() {
-	n        := flag.Int("n", 50000, "number of hands to collect")
-	rollouts := flag.Int("rollouts", 20, "counterfactual rollouts per bid level")
-	workers  := flag.Int("workers", 8, "parallel workers")
-	seed     := flag.Int64("seed", 42, "random seed")
-	out      := flag.String("out", "bid_training.csv", "output CSV path")
+	n         := flag.Int("n", 50000, "number of hands to collect")
+	rollouts  := flag.Int("rollouts", 20, "counterfactual rollouts per bid level")
+	workers   := flag.Int("workers", 8, "parallel workers")
+	seed      := flag.Int64("seed", 42, "random seed")
+	out       := flag.String("out", "bid_training.csv", "output CSV path")
+	modelPath    := flag.String("model", "", "path to card-play model_weights.json for rollouts (default: Balanced)")
+	bidModelPath := flag.String("bid-model", "", "path to bid_model_weights.json for rollouts (default: Balanced)")
+	epsilon      := flag.Float64("epsilon", 0.0, "probability of playing a random card during rollouts (0=deterministic)")
 	flag.Parse()
+
+	// Load card-play MLP for rollouts if provided.
+	var cardModel *ml.MLP
+	if *modelPath != "" {
+		var err error
+		cardModel, err = ml.LoadMLP(*modelPath)
+		if err != nil {
+			log.Fatalf("load card model: %v", err)
+		}
+	}
+	var bidModel *ml.BidMLP
+	if *bidModelPath != "" {
+		var err error
+		bidModel, err = ml.LoadBidMLP(*bidModelPath)
+		if err != nil {
+			log.Fatalf("load bid model: %v", err)
+		}
+	}
 
 	fmt.Printf("Collecting bid training data:\n")
 	fmt.Printf("  Hands:    %d\n", *n)
 	fmt.Printf("  Rollouts: %d per bid level\n", *rollouts)
 	fmt.Printf("  Workers:  %d\n", *workers)
 	fmt.Printf("  Seed:     %d\n", *seed)
-	fmt.Printf("  Output:   %s\n\n", *out)
+	fmt.Printf("  Output:   %s\n", *out)
+	if cardModel != nil {
+		fmt.Printf("  Rollout play: MLP (%s)\n", *modelPath)
+	} else {
+		fmt.Printf("  Rollout play: Balanced\n")
+	}
+	if bidModel != nil {
+		fmt.Printf("  Rollout bid:  MLP (%s)\n", *bidModelPath)
+	} else {
+		fmt.Printf("  Rollout bid:  Balanced\n")
+	}
+	if *epsilon > 0 {
+		fmt.Printf("  Epsilon:      %.3f (random play rate)\n", *epsilon)
+	}
+	fmt.Println()
 
 	f, err := os.Create(*out)
 	if err != nil {
@@ -94,7 +160,21 @@ func main() {
 			var rolloutStrats [6]game.Strategy
 			for s := 0; s < 6; s++ {
 				strats[s] = strategy.NewStandard(strategy.Balanced)
-				rolloutStrats[s] = strategy.NewStandard(strategy.Balanced)
+				var base game.Strategy
+				if cardModel != nil {
+					rollout := mlstrategy.NewMLPStrategy(cardModel.Clone(), strategy.Balanced)
+					if bidModel != nil {
+						rollout = rollout.WithBidModel(bidModel)
+					}
+					base = rollout
+				} else {
+					base = strategy.NewStandard(strategy.Balanced)
+				}
+				if *epsilon > 0 {
+					rolloutStrats[s] = &epsilonStrategy{inner: base, epsilon: *epsilon, rng: rng}
+				} else {
+					rolloutStrats[s] = base
+				}
 			}
 
 			for i := 0; i < perWorker; i++ {
@@ -115,7 +195,7 @@ func main() {
 				if wid == 0 {
 					done := totalHands.Add(1)
 					if done%1000 == 0 {
-						fmt.Printf("  %d / %d hands\n", done*int64(*workers), int64(*n))
+						fmt.Printf("  %d / %d hands\n", done, int64(*n))
 					}
 				} else {
 					totalHands.Add(1)

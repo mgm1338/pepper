@@ -5,14 +5,14 @@ import "github.com/max/pepper/internal/card"
 // PepperExchange performs the card exchange when pepper is called.
 // Each partner gives their best trump card to the caller.
 // The caller receives 2 cards and discards 2, keeping their hand at 8.
-// Returns the updated hands and the seats that will sit out (the two partners).
+// hands is modified in place to avoid heap escape. Returns the sitting-out seats.
 func PepperExchange(
-	hands [6][]card.Card,
+	hands *[6][]card.Card,
 	callerSeat int,
 	trump card.Suit,
 	giveFn func(seat int, hand []card.Card, trump card.Suit) card.Card,
 	discardFn func(seat int, hand []card.Card, trump card.Suit, received [2]card.Card) [2]card.Card,
-) ([6][]card.Card, [2]int) {
+) [2]int {
 	partners := Partners(callerSeat)
 	var received [2]card.Card
 
@@ -31,21 +31,18 @@ func PepperExchange(
 	}
 	hands[callerSeat] = callerHand
 
-	return hands, partners
+	return partners
 }
 
 // removeCard removes the first occurrence of target from hand and returns the result.
 func removeCard(hand []card.Card, target card.Card) []card.Card {
-	result := make([]card.Card, 0, len(hand))
-	removed := false
-	for _, c := range hand {
-		if !removed && c.Equal(target) {
-			removed = true
-			continue
+	for i, c := range hand {
+		if c.Equal(target) {
+			copy(hand[i:], hand[i+1:])
+			return hand[:len(hand)-1]
 		}
-		result = append(result, c)
 	}
-	return result
+	return hand
 }
 
 // BestTrump returns the highest-ranked trump card in the hand.

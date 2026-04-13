@@ -23,6 +23,8 @@ type BidState struct {
 	Seat        int         // this player's seat
 	DealerSeat  int         // who is the dealer
 	CurrentHigh int         // current highest bid (0 if no bids yet)
+	HighSeat    int         // seat holding the current high bid (-1 if no bids yet)
+	SeatsLeft   int         // seats remaining to bid after this one
 	Scores      [2]int      // current game scores
 }
 
@@ -57,6 +59,8 @@ func RunBidding(
 			Seat:        seat,
 			DealerSeat:  dealer,
 			CurrentHigh: currentHigh,
+			HighSeat:    highSeat,
+			SeatsLeft:   6 - i,
 			Scores:      scores,
 		}
 

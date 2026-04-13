@@ -41,7 +41,7 @@ func (s *MLPStrategy) Bid(seat int, state game.BidState) int {
 // bidWithMLP uses the bid MLP to choose the best bid level.
 // Picks the valid bid level that maximizes expected score delta for this seat's team.
 func bidWithMLP(m *ml.BidMLP, seat int, state game.BidState) int {
-	ctx := ml.BidContext(seat, state.Hand, state.DealerSeat, state.CurrentHigh, state.Scores)
+	ctx := ml.BidContext(seat, state.Hand, state.DealerSeat, state.CurrentHigh, state.HighSeat, state.SeatsLeft, state.Scores)
 
 	bestBid := game.PassBid
 	bestScore := float32(-1e30)

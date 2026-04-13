@@ -19,13 +19,16 @@ def main():
     parser = argparse.ArgumentParser(description="Train MLP for pepper bid decisions")
     parser.add_argument("--data",    default="bid_training.csv",    help="Input CSV from cmd/collect")
     parser.add_argument("--out",     default="bid_model_weights.json", help="Output weights JSON for Go")
-    parser.add_argument("--epochs",  type=int,   default=30,    help="Training epochs")
-    parser.add_argument("--batch",   type=int,   default=4096,  help="Mini-batch size")
-    parser.add_argument("--lr",      type=float, default=1e-3,  help="Adam learning rate")
-    parser.add_argument("--val",     type=float, default=0.1,   help="Validation fraction (rows from end)")
-    parser.add_argument("--h1",      type=int,   default=128,   help="Hidden layer 1 size")
-    parser.add_argument("--h2",      type=int,   default=64,    help="Hidden layer 2 size")
-    parser.add_argument("--wd",      type=float, default=1e-4,  help="L2 weight decay")
+    parser.add_argument("--epochs",   type=int,   default=100,   help="Max training epochs (early-stops via plateau scheduler)")
+    parser.add_argument("--batch",    type=int,   default=4096,  help="Mini-batch size")
+    parser.add_argument("--lr",       type=float, default=1e-3,  help="Adam learning rate")
+    parser.add_argument("--val",      type=float, default=0.1,   help="Validation fraction (rows from end)")
+    parser.add_argument("--h1",       type=int,   default=128,   help="Hidden layer 1 size")
+    parser.add_argument("--h2",       type=int,   default=64,    help="Hidden layer 2 size")
+    parser.add_argument("--h3",       type=int,   default=0,     help="Hidden layer 3 size (0=2-layer model)")
+    parser.add_argument("--wd",       type=float, default=1e-4,  help="L2 weight decay")
+    parser.add_argument("--patience", type=int,   default=5,     help="ReduceLROnPlateau patience (epochs)")
+    parser.add_argument("--min-lr",   type=float, default=1e-6,  help="Stop training when LR drops below this")
     parser.add_argument("--target",  default="score_delta",     help="Target column")
     parser.add_argument("--chunk",   type=int,   default=500_000, help="CSV read chunk size (rows)")
     parser.add_argument("--seed",    type=int,   default=42)
@@ -84,24 +87,37 @@ def main():
     print()
 
     # --- Model ---
-    model = nn.Sequential(
-        nn.Linear(n_feat, args.h1),
-        nn.ReLU(),
-        nn.Linear(args.h1, args.h2),
-        nn.ReLU(),
-        nn.Linear(args.h2, 1),
-    )
+    if args.h3 > 0:
+        model = nn.Sequential(
+            nn.Linear(n_feat, args.h1),
+            nn.ReLU(),
+            nn.Linear(args.h1, args.h2),
+            nn.ReLU(),
+            nn.Linear(args.h2, args.h3),
+            nn.ReLU(),
+            nn.Linear(args.h3, 1),
+        )
+        arch_str = f"{n_feat} → {args.h1} → {args.h2} → {args.h3} → 1"
+    else:
+        model = nn.Sequential(
+            nn.Linear(n_feat, args.h1),
+            nn.ReLU(),
+            nn.Linear(args.h1, args.h2),
+            nn.ReLU(),
+            nn.Linear(args.h2, 1),
+        )
+        arch_str = f"{n_feat} → {args.h1} → {args.h2} → 1"
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model:  {n_feat} → {args.h1} → {args.h2} → 1  ({n_params:,} params)")
-    print(f"Config: lr={args.lr}  wd={args.wd}  batch={args.batch}  epochs={args.epochs}")
+    print(f"Model:  {arch_str}  ({n_params:,} params)")
+    print(f"Config: lr={args.lr}  wd={args.wd}  batch={args.batch}  max_epochs={args.epochs}  patience={args.patience}")
     print()
-    print(f"{'Epoch':>6}  {'Train MSE':>10}  {'Val MSE':>10}  {'Val RMSE':>10}  {'Time':>6}")
-    print("-" * 52)
+    print(f"{'Epoch':>6}  {'Train MSE':>10}  {'Val MSE':>10}  {'Val RMSE':>10}  {'LR':>8}  {'Time':>6}")
+    print("-" * 62)
     sys.stdout.flush()
 
-    opt      = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    loss_fn  = nn.MSELoss()
+    opt       = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=args.patience, factor=0.5, min_lr=args.min_lr)
+    loss_fn   = nn.MSELoss()
 
     best_val   = float("inf")
     best_state = None
@@ -182,13 +198,14 @@ def main():
 
             row_offset = chunk_end
 
-        scheduler.step()
-
         if train_n > 0:
             train_loss /= train_n
         if val_n > 0:
             val_loss /= val_n
         val_rmse = (val_loss ** 0.5) * y_std
+
+        scheduler.step(val_loss)
+        current_lr = opt.param_groups[0]['lr']
 
         marker = " ◀" if val_loss < best_val else ""
         if val_loss < best_val:
@@ -196,8 +213,13 @@ def main():
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
 
         elapsed = time.time() - t_ep
-        print(f"{epoch:>6}  {train_loss:>10.6f}  {val_loss:>10.6f}  {val_rmse:>9.4f}  {elapsed:>5.1f}s{marker}")
+        print(f"{epoch:>6}  {train_loss:>10.6f}  {val_loss:>10.6f}  {val_rmse:>9.4f}  {current_lr:>8.2e}  {elapsed:>5.1f}s{marker}")
         sys.stdout.flush()
+
+        # Early stop when LR has decayed to minimum.
+        if current_lr <= args.min_lr * 1.1:
+            print(f"  Early stop: LR={current_lr:.2e} reached minimum.")
+            break
 
     print()
     print(f"Best val MSE:  {best_val:.6f}  (RMSE ≈ {(best_val**0.5)*y_std:.4f} score points)")
@@ -209,20 +231,42 @@ def main():
     def arr(t):
         return t.detach().numpy().tolist()
 
-    weights = {
-        "w1":         arr(model[0].weight),           # [h1][n_feat]
-        "b1":         arr(model[0].bias),              # [h1]
-        "w2":         arr(model[2].weight),            # [h2][h1]
-        "b2":         arr(model[2].bias),              # [h2]
-        "w3":         arr(model[4].weight.squeeze(0)), # [h2]
-        "b3":         float(model[4].bias[0].item()),
-        "y_mean":     y_mean,
-        "y_std":      y_std,
-        "n_features": n_feat,
-        "hidden1":    args.h1,
-        "hidden2":    args.h2,
-        "target":     args.target,
-    }
+    if args.h3 > 0:
+        weights = {
+            "w1":         arr(model[0].weight),           # [h1][n_feat]
+            "b1":         arr(model[0].bias),              # [h1]
+            "w2":         arr(model[2].weight),            # [h2][h1]
+            "b2":         arr(model[2].bias),              # [h2]
+            "w3":         [],                              # unused in 3-layer model
+            "b3":         0.0,
+            "w3h":        arr(model[4].weight),            # [h3][h2]
+            "b3h":        arr(model[4].bias),              # [h3]
+            "w4":         arr(model[6].weight.squeeze(0)), # [h3]
+            "b4":         float(model[6].bias[0].item()),
+            "y_mean":     y_mean,
+            "y_std":      y_std,
+            "n_features": n_feat,
+            "hidden1":    args.h1,
+            "hidden2":    args.h2,
+            "hidden3":    args.h3,
+            "target":     args.target,
+        }
+    else:
+        weights = {
+            "w1":         arr(model[0].weight),           # [h1][n_feat]
+            "b1":         arr(model[0].bias),              # [h1]
+            "w2":         arr(model[2].weight),            # [h2][h1]
+            "b2":         arr(model[2].bias),              # [h2]
+            "w3":         arr(model[4].weight.squeeze(0)), # [h2]
+            "b3":         float(model[4].bias[0].item()),
+            "y_mean":     y_mean,
+            "y_std":      y_std,
+            "n_features": n_feat,
+            "hidden1":    args.h1,
+            "hidden2":    args.h2,
+            "hidden3":    0,
+            "target":     args.target,
+        }
 
     with open(args.out, "w") as f:
         json.dump(weights, f)

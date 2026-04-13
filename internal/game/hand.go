@@ -81,8 +81,8 @@ func playHandFrom(gs *GameState, strategies [6]Strategy, rng *rand.Rand, log Log
 		pepperActive = true
 		var given [2]card.Card
 		var discarded [2]card.Card
-		hands, sittingOut = PepperExchange(
-			hands,
+		sittingOut = PepperExchange(
+			&hands,
 			callerSeat,
 			trump,
 			func(seat int, hand []card.Card, trump card.Suit) card.Card {
@@ -155,15 +155,13 @@ func playHandFrom(gs *GameState, strategies [6]Strategy, rng *rand.Rand, log Log
 		if card.EffectiveSuit(trick.Cards[0].Card, trump) == trump {
 			trumpStats.TrumpLedsCount++
 		}
-		var trickCards []card.Card
 		for _, pc := range trick.Cards {
 			if card.TrumpRank(pc.Card, trump) >= 0 {
 				cumulativeTrumpPlayed++
 			}
-			trickCards = append(trickCards, pc.Card)
 		}
 		trumpStats.TrumpPlayedByTrick[t] = cumulativeTrumpPlayed
-		history.Record(trickCards)
+		history.RecordTrick(trick.Cards)
 
 		winner := trick.Winner()
 		tricksTaken[winner]++

@@ -2,6 +2,7 @@ package ml
 
 import (
 	"math/rand"
+	"sync"
 
 	"github.com/max/pepper/internal/card"
 	"github.com/max/pepper/internal/game"
@@ -38,15 +39,51 @@ type decisionPoint struct {
 	seatStep     int // this seat's step index within activeSeats for current trick
 }
 
+// handBufPool provides reusable [6][]card.Card arrays to eliminate per-rollout allocations.
+// Each buffer holds 6 slices of capacity 8 (max hand size in Pepper).
+var handBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := new([6][]card.Card)
+		for i := range buf {
+			buf[i] = make([]card.Card, 8)
+		}
+		return buf
+	},
+}
+
+// trickPool provides reusable Trick objects to eliminate per-playHand allocations.
+var trickPool = sync.Pool{
+	New: func() interface{} {
+		return game.NewTrick(0, 0)
+	},
+}
+
+// historyPool provides reusable HandHistory objects to eliminate per-rollout heap escapes.
+// HandHistory escapes to heap when &history flows through TrickState.History into an interface call.
+var historyPool = sync.Pool{
+	New: func() interface{} { return new(game.HandHistory) },
+}
+
+// allSeats is the fixed 6-player seat order for non-pepper hands.
+// Returned by buildActiveSeats to avoid per-rollout allocation.
+var allSeats = []int{0, 1, 2, 3, 4, 5}
+
 // rollout simulates the remainder of the hand from this decision point,
 // with forcedCard played by this seat, and all other decisions made by rolloutStrat.
 // Returns the score delta for the bidding team and whether the bid was made.
-func (dp decisionPoint) rollout(forcedCard card.Card, rolloutStrat [6]game.Strategy, rng *rand.Rand) (scoreDelta int, madeBid bool) {
-	// Deep copy hands so each rollout is independent.
-	hands := copyHands(dp.hands)
+func (dp decisionPoint) rollout(forcedCard card.Card, rolloutStrat [6]game.Strategy, rng *rand.Rand, validBuf *[]card.Card) (scoreDelta int, madeBid bool) {
+	// Get a pooled buffer and copy hands into it — avoids per-rollout make() calls.
+	buf := handBufPool.Get().(*[6][]card.Card)
+	var hands [6][]card.Card
+	for i, h := range dp.hands {
+		n := len(h)
+		hands[i] = (*buf)[i][:n]
+		copy(hands[i], h)
+	}
 
-	// Reconstruct history from completed tricks.
-	var history game.HandHistory
+	// Get a pooled HandHistory — avoids heap escape through TrickState.History interface call.
+	history := historyPool.Get().(*game.HandHistory)
+	history.Reset()
 	if len(dp.historyCards) > 0 {
 		history.Record(dp.historyCards)
 	}
@@ -54,7 +91,8 @@ func (dp decisionPoint) rollout(forcedCard card.Card, rolloutStrat [6]game.Strat
 	tricksTaken := dp.tricksTaken
 
 	// --- Finish the current trick ---
-	trick := game.NewTrick(dp.leader, dp.trump)
+	trick := trickPool.Get().(*game.Trick)
+	trick.Reset(dp.leader, dp.trump)
 
 	// Re-add cards already played before this seat.
 	for _, pc := range dp.trick {
@@ -63,12 +101,13 @@ func (dp decisionPoint) rollout(forcedCard card.Card, rolloutStrat [6]game.Strat
 
 	// Play the forced card for this seat.
 	trick.Add(forcedCard, dp.seat)
-	hands[dp.seat] = dropCard(hands[dp.seat], forcedCard)
+	hands[dp.seat] = dropCardInPlace(hands[dp.seat], forcedCard)
 
-	// Remaining seats in the current trick (after this seat's step).
+	// Hoist the leader index computation outside the step loop.
+	leaderIdx := indexInSlice(dp.activeSeats, dp.leader)
 	for step := dp.seatStep + 1; step < len(dp.activeSeats); step++ {
-		nextSeat := dp.activeSeats[(indexInSlice(dp.activeSeats, dp.leader)+step)%len(dp.activeSeats)]
-		valid := game.ValidPlays(hands[nextSeat], trick, dp.trump)
+		nextSeat := dp.activeSeats[(leaderIdx+step)%len(dp.activeSeats)]
+		valid := game.ValidPlaysInto(validBuf, hands[nextSeat], trick, dp.trump)
 		state := game.TrickState{
 			Trick:       trick,
 			Trump:       dp.trump,
@@ -78,31 +117,28 @@ func (dp decisionPoint) rollout(forcedCard card.Card, rolloutStrat [6]game.Strat
 			TrickNumber: dp.trickNum,
 			TricksTaken: tricksTaken,
 			Scores:      dp.scores,
-			History:     &history,
+			History:     history,
 			Hand:        hands[nextSeat],
 		}
 		chosen := rolloutStrat[nextSeat].Play(nextSeat, valid, state)
 		trick.Add(chosen, nextSeat)
-		hands[nextSeat] = dropCard(hands[nextSeat], chosen)
+		hands[nextSeat] = dropCardInPlace(hands[nextSeat], chosen)
 	}
 
 	// Record completed trick in history and update state.
-	var trickCards []card.Card
-	for _, pc := range trick.Cards {
-		trickCards = append(trickCards, pc.Card)
-	}
-	history.Record(trickCards)
+	history.RecordTrick(trick.Cards)
 	winner := trick.Winner()
 	tricksTaken[winner]++
 	leader := winner
 
-	// --- Play remaining tricks ---
+	// --- Play remaining tricks, reusing trick object ---
 	for t := dp.trickNum + 1; t < game.TotalTricks; t++ {
-		trick = game.NewTrick(leader, dp.trump)
+		trick.Reset(leader, dp.trump)
 
+		leaderIdx = indexInSlice(dp.activeSeats, leader)
 		for step := 0; step < len(dp.activeSeats); step++ {
-			s := dp.activeSeats[(indexInSlice(dp.activeSeats, leader)+step)%len(dp.activeSeats)]
-			valid := game.ValidPlays(hands[s], trick, dp.trump)
+			s := dp.activeSeats[(leaderIdx+step)%len(dp.activeSeats)]
+			valid := game.ValidPlaysInto(validBuf, hands[s], trick, dp.trump)
 			state := game.TrickState{
 				Trick:       trick,
 				Trump:       dp.trump,
@@ -112,23 +148,23 @@ func (dp decisionPoint) rollout(forcedCard card.Card, rolloutStrat [6]game.Strat
 				TrickNumber: t,
 				TricksTaken: tricksTaken,
 				Scores:      dp.scores,
-				History:     &history,
+				History:     history,
 				Hand:        hands[s],
 			}
 			chosen := rolloutStrat[s].Play(s, valid, state)
 			trick.Add(chosen, s)
-			hands[s] = dropCard(hands[s], chosen)
+			hands[s] = dropCardInPlace(hands[s], chosen)
 		}
 
-		trickCards = trickCards[:0]
-		for _, pc := range trick.Cards {
-			trickCards = append(trickCards, pc.Card)
-		}
-		history.Record(trickCards)
+		history.RecordTrick(trick.Cards)
 		winner = trick.Winner()
 		tricksTaken[winner]++
 		leader = winner
 	}
+
+	handBufPool.Put(buf)
+	trickPool.Put(trick)
+	historyPool.Put(history)
 
 	// Score the hand.
 	var tricksByTeam [2]int
@@ -177,8 +213,8 @@ func CollectHand(
 	var sittingOut [2]int
 	isPepper := bidResult.IsPepper
 	if isPepper {
-		hands, sittingOut = game.PepperExchange(
-			hands,
+		sittingOut = game.PepperExchange(
+			&hands,
 			callerSeat,
 			trump,
 			func(seat int, hand []card.Card, trump card.Suit) card.Card {
@@ -197,12 +233,14 @@ func CollectHand(
 	leader := callerSeat
 	var history game.HandHistory
 	var rows []CollectRow
+	var rolloutValidBuf []card.Card // reused across all rollouts for this hand
 
 	for t := 0; t < game.TotalTricks; t++ {
 		trick := game.NewTrick(leader, trump)
 
+		leaderIdx := indexInSlice(activeSeats, leader)
 		for step := 0; step < len(activeSeats); step++ {
-			seat := activeSeats[(indexInSlice(activeSeats, leader)+step)%len(activeSeats)]
+			seat := activeSeats[(leaderIdx+step)%len(activeSeats)]
 			valid := game.ValidPlays(hands[seat], trick, trump)
 
 			state := game.TrickState{
@@ -225,7 +263,7 @@ func CollectHand(
 				trick:        copyPlayedCards(trick.Cards),
 				trickNum:     t,
 				tricksTaken:  tricksTaken,
-				historyCards: history.Played(),
+				historyCards: history.PlayedSlice(),
 				leader:       leader,
 				trump:        trump,
 				callerSeat:   callerSeat,
@@ -244,7 +282,7 @@ func CollectHand(
 				var totalDelta float64
 				madeBidCount := 0
 				for r := 0; r < rollouts; r++ {
-					delta, made := dp.rollout(candidate, rolloutStrat, rng)
+					delta, made := dp.rollout(candidate, rolloutStrat, rng, &rolloutValidBuf)
 					totalDelta += float64(delta)
 					if made {
 						madeBidCount++
@@ -264,15 +302,10 @@ func CollectHand(
 			// Play the actual card using the base strategy.
 			chosen := strategies[seat].Play(seat, valid, state)
 			trick.Add(chosen, seat)
-			hands[seat] = dropCard(hands[seat], chosen)
+			hands[seat] = dropCardInPlace(hands[seat], chosen)
 		}
 
-		// Record trick in history.
-		trickCards := make([]card.Card, len(trick.Cards))
-		for j, pc := range trick.Cards {
-			trickCards[j] = pc.Card
-		}
-		history.Record(trickCards)
+		history.RecordTrick(trick.Cards)
 
 		winner := trick.Winner()
 		tricksTaken[winner]++
@@ -284,17 +317,16 @@ func CollectHand(
 
 // --- Helpers ---
 
-func dropCard(hand []card.Card, target card.Card) []card.Card {
-	result := make([]card.Card, 0, len(hand))
-	removed := false
-	for _, c := range hand {
-		if !removed && c.Equal(target) {
-			removed = true
-			continue
+// dropCardInPlace removes target from hand by shifting elements left.
+// Returns the shortened slice backed by the same array — no allocation.
+func dropCardInPlace(hand []card.Card, target card.Card) []card.Card {
+	for i, c := range hand {
+		if c.Equal(target) {
+			copy(hand[i:], hand[i+1:])
+			return hand[:len(hand)-1]
 		}
-		result = append(result, c)
 	}
-	return result
+	return hand
 }
 
 func copyHands(hands [6][]card.Card) [6][]card.Card {
@@ -314,11 +346,7 @@ func copyPlayedCards(pcs []game.PlayedCard) []game.PlayedCard {
 
 func buildActiveSeats(pepperActive bool, callerSeat int, sittingOut [2]int) []int {
 	if !pepperActive {
-		seats := make([]int, 6)
-		for i := range seats {
-			seats[i] = i
-		}
-		return seats
+		return allSeats // shared read-only slice, no allocation
 	}
 	sitting := map[int]bool{sittingOut[0]: true, sittingOut[1]: true}
 	var active []int

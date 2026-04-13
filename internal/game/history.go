@@ -12,27 +12,51 @@ func init() {
 	}
 }
 
+// maxHandCards is the maximum cards played in a hand: 8 tricks × 6 players.
+const maxHandCards = 48
+
 // HandHistory tracks all cards played in completed tricks this hand.
 // Passed to every strategy call so bots can reason about what is still live.
+// The fixed-size array avoids heap allocation as the history grows.
 type HandHistory struct {
-	played []card.Card // cards from completed tricks, in play order
+	played [maxHandCards]card.Card
+	n      int
 }
 
-// Record adds a card to the history. Called after each trick completes.
+// Reset clears the history for reuse (e.g. from a sync.Pool).
+// Only resets the count — the underlying array is not zeroed.
+func (h *HandHistory) Reset() { h.n = 0 }
+
+// Record adds cards to the history. Called after each trick completes.
 func (h *HandHistory) Record(cards []card.Card) {
-	h.played = append(h.played, cards...)
+	h.n += copy(h.played[h.n:], cards)
+}
+
+// RecordTrick adds the cards from a completed trick directly, avoiding an intermediate slice.
+func (h *HandHistory) RecordTrick(cards []PlayedCard) {
+	for _, pc := range cards {
+		h.played[h.n] = pc.Card
+		h.n++
+	}
 }
 
 // Played returns a copy of all cards seen so far.
 func (h *HandHistory) Played() []card.Card {
-	cp := make([]card.Card, len(h.played))
-	copy(cp, h.played)
+	cp := make([]card.Card, h.n)
+	copy(cp, h.played[:h.n])
 	return cp
+}
+
+// PlayedSlice returns the underlying slice directly (no copy).
+// The caller must not modify the returned slice.
+// Use in rollout hot paths where the history is read-only.
+func (h *HandHistory) PlayedSlice() []card.Card {
+	return h.played[:h.n]
 }
 
 // IsSeen returns true if this specific card (suit+rank+copy) has been played.
 func (h *HandHistory) IsSeen(c card.Card) bool {
-	for _, p := range h.played {
+	for _, p := range h.played[:h.n] {
 		if p.Equal(c) {
 			return true
 		}
@@ -43,7 +67,7 @@ func (h *HandHistory) IsSeen(c card.Card) bool {
 // RightBowersPlayed returns how many right bowers have been played (0, 1, or 2).
 func (h *HandHistory) RightBowersPlayed(trump card.Suit) int {
 	n := 0
-	for _, p := range h.played {
+	for _, p := range h.played[:h.n] {
 		if card.IsRightBower(p, trump) {
 			n++
 		}
@@ -54,7 +78,7 @@ func (h *HandHistory) RightBowersPlayed(trump card.Suit) int {
 // LeftBowersPlayed returns how many left bowers have been played (0, 1, or 2).
 func (h *HandHistory) LeftBowersPlayed(trump card.Suit) int {
 	n := 0
-	for _, p := range h.played {
+	for _, p := range h.played[:h.n] {
 		if card.IsLeftBower(p, trump) {
 			n++
 		}
@@ -65,7 +89,7 @@ func (h *HandHistory) LeftBowersPlayed(trump card.Suit) int {
 // TrumpPlayed returns how many trump cards have been played total.
 func (h *HandHistory) TrumpPlayed(trump card.Suit) int {
 	n := 0
-	for _, p := range h.played {
+	for _, p := range h.played[:h.n] {
 		if card.TrumpRank(p, trump) >= 0 {
 			n++
 		}
@@ -99,7 +123,7 @@ func (h *HandHistory) IsTopTrump(c card.Card, trump card.Suit) bool {
 // is safe (opponents can only ruff, not follow).
 func (h *HandHistory) CardsPlayedInSuit(suit card.Suit, trump card.Suit) int {
 	n := 0
-	for _, p := range h.played {
+	for _, p := range h.played[:h.n] {
 		if card.EffectiveSuit(p, trump) == suit {
 			n++
 		}

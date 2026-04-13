@@ -33,3 +33,37 @@ func Deal(rng *rand.Rand) [6][]Card {
 	}
 	return hands
 }
+
+// DealAround deals 8 cards to each of the 5 seats other than fixedSeat,
+// randomly sampling from the 40 cards not held by fixedSeat.
+// The returned hands[fixedSeat] is a copy of fixedHand; all other hands are freshly sampled.
+func DealAround(fixedSeat int, fixedHand []Card, rng *rand.Rand) [6][]Card {
+	// Build the remaining 40 cards by removing fixedHand from a full deck.
+	used := make(map[Card]int, len(fixedHand))
+	for _, c := range fixedHand {
+		used[c]++
+	}
+	remaining := make([]Card, 0, 40)
+	for _, c := range NewPinochleDeck() {
+		if used[c] > 0 {
+			used[c]--
+		} else {
+			remaining = append(remaining, c)
+		}
+	}
+	Shuffle(remaining, rng)
+
+	var hands [6][]Card
+	j := 0
+	for i := 0; i < 6; i++ {
+		if i == fixedSeat {
+			hands[i] = make([]Card, len(fixedHand))
+			copy(hands[i], fixedHand)
+		} else {
+			hands[i] = make([]Card, 8)
+			copy(hands[i], remaining[j:j+8])
+			j += 8
+		}
+	}
+	return hands
+}

@@ -29,13 +29,13 @@ type bidPoint struct {
 }
 
 // rollout completes the auction and plays the hand, returning score delta for dp.seat's team.
-func (dp bidPoint) rollout(forcedBid int, rolloutStrat [6]game.Strategy, rng *rand.Rand) int {
+func (dp bidPoint) rollout(forcedBid int, rolloutStrat [6]game.Strategy, rng *rand.Rand, validBuf *[]card.Card) int {
 	currentHigh := dp.currentHigh
 	highSeat := dp.highSeat
 
 	// Apply this seat's forced bid.
 	if forcedBid == game.PepperBid {
-		return dp.playHand(dp.seat, game.PepperBid, true, rolloutStrat, rng)
+		return dp.playHand(dp.hands, dp.seat, game.PepperBid, true, rolloutStrat, rng, validBuf)
 	}
 	if forcedBid != game.PassBid {
 		minRequired := game.MinBid
@@ -54,7 +54,7 @@ func (dp bidPoint) rollout(forcedBid int, rolloutStrat [6]game.Strategy, rng *ra
 		isDealerTurn := nextSeat == dp.dealer
 		if isDealerTurn && highSeat == -1 {
 			// Dealer stuck at 3.
-			return dp.playHand(dp.dealer, game.StuckBid, false, rolloutStrat, rng)
+			return dp.playHand(dp.hands, dp.dealer, game.StuckBid, false, rolloutStrat, rng, validBuf)
 		}
 
 		bidState := game.BidState{
@@ -67,7 +67,7 @@ func (dp bidPoint) rollout(forcedBid int, rolloutStrat [6]game.Strategy, rng *ra
 		bid := rolloutStrat[nextSeat].Bid(nextSeat, bidState)
 
 		if bid == game.PepperBid {
-			return dp.playHand(nextSeat, game.PepperBid, true, rolloutStrat, rng)
+			return dp.playHand(dp.hands, nextSeat, game.PepperBid, true, rolloutStrat, rng, validBuf)
 		}
 		if bid != game.PassBid {
 			minRequired := game.MinBid
@@ -85,26 +85,35 @@ func (dp bidPoint) rollout(forcedBid int, rolloutStrat [6]game.Strategy, rng *ra
 		// Shouldn't happen (dealer stuck prevents this), but guard anyway.
 		return 0
 	}
-	return dp.playHand(highSeat, currentHigh, false, rolloutStrat, rng)
+	return dp.playHand(dp.hands, highSeat, currentHigh, false, rolloutStrat, rng, validBuf)
 }
 
 // playHand plays a complete hand given the auction result and returns score delta
-// for dp.seat's team.
+// for dp.seat's team. dealtHands are the hands for this rollout (already re-sampled).
 func (dp bidPoint) playHand(
+	dealtHands [6][]card.Card,
 	callerSeat int,
 	bidAmount int,
 	isPepper bool,
 	rolloutStrat [6]game.Strategy,
 	rng *rand.Rand,
+	validBuf *[]card.Card,
 ) int {
-	hands := copyHands(dp.hands)
+	// Get a pooled buffer and copy hands into it — avoids per-rollout make() calls.
+	buf := handBufPool.Get().(*[6][]card.Card)
+	var hands [6][]card.Card
+	for i, h := range dealtHands {
+		n := len(h)
+		hands[i] = (*buf)[i][:n]
+		copy(hands[i], h)
+	}
 
 	trump := rolloutStrat[callerSeat].ChooseTrump(callerSeat, hands[callerSeat])
 
 	var sittingOut [2]int
 	if isPepper {
-		hands, sittingOut = game.PepperExchange(
-			hands,
+		sittingOut = game.PepperExchange(
+			&hands,
 			callerSeat,
 			trump,
 			func(seat int, hand []card.Card, t card.Suit) card.Card {
@@ -119,13 +128,19 @@ func (dp bidPoint) playHand(
 	activeSeats := buildActiveSeats(isPepper, callerSeat, sittingOut)
 	tricksTaken := [6]int{}
 	leader := callerSeat
-	var history game.HandHistory
 
+	// Get a pooled HandHistory — avoids heap escape through TrickState.History interface call.
+	history := historyPool.Get().(*game.HandHistory)
+	history.Reset()
+
+	trick := trickPool.Get().(*game.Trick)
+	trick.Reset(leader, trump)
 	for t := 0; t < game.TotalTricks; t++ {
-		trick := game.NewTrick(leader, trump)
+		trick.Reset(leader, trump)
+		leaderIdx := indexInSlice(activeSeats, leader)
 		for step := 0; step < len(activeSeats); step++ {
-			seat := activeSeats[(indexInSlice(activeSeats, leader)+step)%len(activeSeats)]
-			valid := game.ValidPlays(hands[seat], trick, trump)
+			seat := activeSeats[(leaderIdx+step)%len(activeSeats)]
+			valid := game.ValidPlaysInto(validBuf, hands[seat], trick, trump)
 			state := game.TrickState{
 				Trick:       trick,
 				Trump:       trump,
@@ -135,23 +150,23 @@ func (dp bidPoint) playHand(
 				TrickNumber: t,
 				TricksTaken: tricksTaken,
 				Scores:      dp.scores,
-				History:     &history,
+				History:     history,
 				Hand:        hands[seat],
 			}
 			chosen := rolloutStrat[seat].Play(seat, valid, state)
 			trick.Add(chosen, seat)
-			hands[seat] = dropCard(hands[seat], chosen)
+			hands[seat] = dropCardInPlace(hands[seat], chosen)
 		}
 
-		var trickCards []card.Card
-		for _, pc := range trick.Cards {
-			trickCards = append(trickCards, pc.Card)
-		}
-		history.Record(trickCards)
+		history.RecordTrick(trick.Cards)
 		winner := trick.Winner()
 		tricksTaken[winner]++
 		leader = winner
 	}
+
+	handBufPool.Put(buf)
+	trickPool.Put(trick)
+	historyPool.Put(history)
 
 	var tricksByTeam [2]int
 	for s, count := range tricksTaken {
@@ -178,7 +193,9 @@ func CollectBidHand(
 
 	currentHigh := 0
 	highSeat := -1
-	var rows []BidCollectRow
+	// Pre-allocate: up to 6 seats × up to 6 bid levels per seat.
+	rows := make([]BidCollectRow, 0, 6*6)
+	var validBuf []card.Card // reused across all rollouts for this hand
 
 	for i := 1; i <= 6; i++ {
 		seat := (dealer + i) % 6
@@ -214,13 +231,13 @@ func CollectBidHand(
 		}
 
 		// Extract context features once for this decision point.
-		ctx := BidContext(seat, hands[seat], dealer, currentHigh, scores)
+		ctx := BidContext(seat, hands[seat], dealer, currentHigh, highSeat, len(seatsLeft), scores)
 
 		// Evaluate each valid bid level via counterfactual rollouts.
 		for _, bidLevel := range ValidBidLevels(currentHigh) {
 			var totalDelta float64
 			for r := 0; r < rollouts; r++ {
-				delta := dp.rollout(bidLevel, rolloutStrat, rng)
+				delta := dp.rollout(bidLevel, rolloutStrat, rng, &validBuf)
 				totalDelta += float64(delta)
 			}
 			rows = append(rows, BidCollectRow{

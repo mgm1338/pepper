@@ -671,29 +671,27 @@ func (s *StandardStrategy) bestTrumpWithBias(hand []card.Card) (card.Suit, float
 }
 
 func (s *StandardStrategy) suitScore(hand []card.Card, trump card.Suit) float64 {
-	var trumpCards []card.Card
-	for _, c := range hand {
-		if card.TrumpRank(c, trump) >= 0 {
-			trumpCards = append(trumpCards, c)
-		}
-	}
 	score := 0.0
-	for _, c := range trumpCards {
+	trumpCount := 0
+	for _, c := range hand {
 		tr := card.TrumpRank(c, trump)
+		if tr < 0 {
+			continue
+		}
+		trumpCount++
 		switch {
 		case tr >= 12: // right bower
 			score += s.cfg.RightBowerScore
 		case tr >= 11: // left bower
 			score += s.cfg.LeftBowerScore
-		case tr >= 9: // ace, king
+		case tr >= 9: // ace
 			score += s.cfg.AceKingScore
-		default: // queen, jack (non-bower), ten, nine
+		default: // king, queen, ten, nine
 			score += s.cfg.LowTrumpScore
 		}
 	}
 	// Length bonus for trump beyond the base 5.
-	extra := len(trumpCards) - 5
-	if extra > 0 {
+	if extra := trumpCount - 5; extra > 0 {
 		score += float64(extra) * s.cfg.TrumpLengthBonus
 	}
 	// Major suit bonus.
@@ -761,14 +759,30 @@ func (s *StandardStrategy) selectProfile(state game.TrickState) *PlayProfile {
 
 func (s *StandardStrategy) chooseLead(seat int, hand []card.Card, state game.TrickState, trump card.Suit) card.Card {
 	isBiddingTeam := game.TeamOf(seat) == game.TeamOf(state.BidderSeat)
-	trumpCards := filterTrump(hand, trump)
 	p := s.selectProfile(state)
+
+	// Single pass: count trump and detect bower presence.
+	trumpCount := 0
+	hasRight := false
+	hasLeft := false
+	for _, c := range hand {
+		if card.TrumpRank(c, trump) < 0 {
+			continue
+		}
+		trumpCount++
+		if card.IsRightBower(c, trump) {
+			hasRight = true
+		} else if card.IsLeftBower(c, trump) {
+			hasLeft = true
+		}
+	}
 
 	// Universal override: lead highest available card regardless of role.
 	if p.LeadHigh {
 		if isBiddingTeam {
-			if len(trumpCards) > 0 {
-				return highestTrump(trumpCards, trump)
+			if trumpCount > 0 {
+				c, _ := highestTrumpInHand(hand, trump)
+				return c
 			}
 			if c, ok := highestOffSuit(hand, trump); ok {
 				return c
@@ -777,8 +791,9 @@ func (s *StandardStrategy) chooseLead(seat int, hand []card.Card, state game.Tri
 			if c, ok := highestOffSuit(hand, trump); ok {
 				return c
 			}
-			if len(trumpCards) > 0 {
-				return highestTrump(trumpCards, trump)
+			if trumpCount > 0 {
+				c, _ := highestTrumpInHand(hand, trump)
+				return c
 			}
 		}
 		return hand[0]
@@ -794,20 +809,9 @@ func (s *StandardStrategy) chooseLead(seat int, hand []card.Card, state game.Tri
 		// 6. Short suit / void hunting.
 		// 7. Lowest throwaway.
 
-		hasRight := false
-		hasLeft := false
-		for _, c := range trumpCards {
-			if card.IsRightBower(c, trump) {
-				hasRight = true
-			}
-			if card.IsLeftBower(c, trump) {
-				hasLeft = true
-			}
-		}
-
 		// 1. Right bower.
 		if p.PullTrumpWithRight && hasRight {
-			for _, c := range trumpCards {
+			for _, c := range hand {
 				if card.IsRightBower(c, trump) {
 					return c
 				}
@@ -822,14 +826,15 @@ func (s *StandardStrategy) chooseLead(seat int, hand []card.Card, state game.Tri
 		}
 
 		// 3. Keep pulling trump while opponents appear to still have trump.
-		if len(trumpCards) > 0 {
+		if trumpCount > 0 {
 			trumpRemaining := 14
 			if state.History != nil {
 				trumpRemaining = state.History.TrumpRemaining(trump)
 			}
-			opponentTrumpEst := trumpRemaining - len(trumpCards) - 1
-			if opponentTrumpEst > 0 && len(trumpCards) >= p.PullTrumpMinCount {
-				return lowestTrump(trumpCards, trump)
+			opponentTrumpEst := trumpRemaining - trumpCount - 1
+			if opponentTrumpEst > 0 && trumpCount >= p.PullTrumpMinCount {
+				c, _ := lowestTrumpInHand(hand, trump)
+				return c
 			}
 		}
 
@@ -840,7 +845,7 @@ func (s *StandardStrategy) chooseLead(seat int, hand []card.Card, state game.Tri
 
 		// 5. Left bower — only if we also have the right.
 		if hasLeft && hasRight {
-			for _, c := range trumpCards {
+			for _, c := range hand {
 				if card.IsLeftBower(c, trump) {
 					return c
 				}
@@ -858,8 +863,9 @@ func (s *StandardStrategy) chooseLead(seat int, hand []card.Card, state game.Tri
 		if c, ok := lowestNonTrump(hand, trump); ok {
 			return c
 		}
-		if len(trumpCards) > 0 {
-			return lowestTrump(trumpCards, trump)
+		if trumpCount > 0 {
+			c, _ := lowestTrumpInHand(hand, trump)
+			return c
 		}
 		return hand[0]
 	}
@@ -871,19 +877,10 @@ func (s *StandardStrategy) chooseLead(seat int, hand []card.Card, state game.Tri
 	bidderRelPos := (state.BidderSeat - seat + 6) % 6
 	avoidTrump := p.DefensiveAvoidLeadingIntoHand && bidderRelPos == 1
 
-	// Scan trump holding for right bower.
-	hasRightDefense := false
-	for _, c := range trumpCards {
-		if card.IsRightBower(c, trump) {
-			hasRightDefense = true
-			break
-		}
-	}
-
 	// DefensiveLeadRight: cash right bower immediately (overridden by DefensiveSaveRight
 	// and DefensiveAvoidLeadingIntoHand).
-	if p.DefensiveLeadRight && !p.DefensiveSaveRight && hasRightDefense && !avoidTrump {
-		for _, c := range trumpCards {
+	if p.DefensiveLeadRight && !p.DefensiveSaveRight && hasRight && !avoidTrump {
+		for _, c := range hand {
 			if card.IsRightBower(c, trump) {
 				return c
 			}
@@ -891,15 +888,17 @@ func (s *StandardStrategy) chooseLead(seat int, hand []card.Card, state game.Tri
 	}
 
 	// DefensiveTrumpWithRightThreshold: lead trump when holding right + enough total trump.
-	if hasRightDefense && !avoidTrump && !p.DefensiveSaveRight {
-		if len(trumpCards) >= p.DefensiveTrumpWithRightThreshold {
-			return highestTrump(trumpCards, trump)
+	if hasRight && !avoidTrump && !p.DefensiveSaveRight {
+		if trumpCount >= p.DefensiveTrumpWithRightThreshold {
+			c, _ := highestTrumpInHand(hand, trump)
+			return c
 		}
 	}
 
 	// DefensiveTrumpLeadMin: lead trump with a dominant holding regardless of right bower.
-	if p.DefensiveTrumpLeadMin > 0 && len(trumpCards) >= p.DefensiveTrumpLeadMin && !avoidTrump {
-		return highestTrump(trumpCards, trump)
+	if p.DefensiveTrumpLeadMin > 0 && trumpCount >= p.DefensiveTrumpLeadMin && !avoidTrump {
+		c, _ := highestTrumpInHand(hand, trump)
+		return c
 	}
 
 	// Lead card by rank preference.
@@ -929,8 +928,9 @@ func (s *StandardStrategy) chooseLead(seat int, hand []card.Card, state game.Tri
 	if c, ok := lowestNonTrump(hand, trump); ok {
 		return c
 	}
-	if len(trumpCards) > 0 {
-		return lowestTrump(trumpCards, trump)
+	if trumpCount > 0 {
+		c, _ := lowestTrumpInHand(hand, trump)
+		return c
 	}
 	return hand[0]
 }
@@ -942,23 +942,20 @@ func (s *StandardStrategy) chooseFollow(seat int, hand []card.Card, state game.T
 	isBiddingTeam := game.TeamOf(seat) == game.TeamOf(state.BidderSeat)
 	p := s.selectProfile(state)
 
+	// Precompute winner card info once — O(1) now that Trick maintains winner incrementally.
+	winCard := trick.WinnerCard()
+	winTR := card.TrumpRank(winCard, trump)
+	winNR := card.NonTrumpRank(winCard)
+	ledSuit := trick.LedSuit()
+
 	// Duck and cover: if partner is winning, play lowest legal card.
 	if p.DuckAndCover && partnerWinning {
 		// OvertrumpPartner exception: if partner is winning with trump and we have higher
 		// trump, over-trump to consolidate the bidding team's trump holdings.
 		if p.OvertrumpPartner && isBiddingTeam {
-			for _, pc := range trick.Cards {
-				if pc.Seat == currentWinner {
-					winTR := card.TrumpRank(pc.Card, trump)
-					if winTR >= 0 {
-						trumpCards := filterTrump(hand, trump)
-						for _, c := range trumpCards {
-							if card.TrumpRank(c, trump) > winTR {
-								return highestTrump(trumpCards, trump)
-							}
-						}
-					}
-					break
+			if winTR >= 0 {
+				if c, ok := highestTrumpInHand(hand, trump); ok && card.TrumpRank(c, trump) > winTR {
+					return c
 				}
 			}
 		}
@@ -967,14 +964,14 @@ func (s *StandardStrategy) chooseFollow(seat int, hand []card.Card, state game.T
 
 	// Defensive high follow: play highest winner to maximize euchre chances.
 	if !isBiddingTeam && p.DefensiveHighFollow && !partnerWinning {
-		if winning := highestWinner(hand, trick, trump); winning != nil {
+		if winning := highestWinner(hand, winCard, winTR, winNR, ledSuit, trump); winning != nil {
 			return *winning
 		}
 		return lowestCard(hand, trump)
 	}
 
 	// Try to win the trick with the lowest card that beats current winner.
-	if winning := lowestWinner(hand, trick, trump); winning != nil {
+	if winning := lowestWinner(hand, winCard, winTR, winNR, ledSuit, trump); winning != nil {
 		return *winning
 	}
 
@@ -991,9 +988,8 @@ func (s *StandardStrategy) chooseFollow(seat int, hand []card.Card, state game.T
 // --- Pepper play ---
 
 func (s *StandardStrategy) pepperCallerLead(hand []card.Card, trump card.Suit) card.Card {
-	trumpCards := filterTrump(hand, trump)
-	if len(trumpCards) > 0 {
-		return highestTrump(trumpCards, trump)
+	if c, ok := highestTrumpInHand(hand, trump); ok {
+		return c
 	}
 	if c, ok := highestOffSuit(hand, trump); ok {
 		return c
@@ -1014,11 +1010,11 @@ func (s *StandardStrategy) pepperCallerFollow(hand []card.Card, state game.Trick
 	winTR := card.TrumpRank(winCard, trump)
 	ledSuit := trick.LedSuit()
 
-	var winners []card.Card
-	for _, c := range hand {
+	var best *card.Card
+	for i, c := range hand {
 		tr := card.TrumpRank(c, trump)
 		effSuit := card.EffectiveSuit(c, trump)
-		var beats bool
+		beats := false
 		if winTR >= 0 {
 			beats = tr > winTR
 		} else {
@@ -1028,30 +1024,31 @@ func (s *StandardStrategy) pepperCallerFollow(hand []card.Card, state game.Trick
 				beats = true
 			}
 		}
-		if beats {
-			winners = append(winners, c)
+		if !beats {
+			continue
 		}
-	}
-	if len(winners) == 0 {
-		return lowestCard(hand, trump)
-	}
-	best := winners[0]
-	for _, c := range winners[1:] {
-		cTR := card.TrumpRank(c, trump)
-		bTR := card.TrumpRank(best, trump)
+		if best == nil {
+			best = &hand[i]
+			continue
+		}
+		cTR := tr
+		bTR := card.TrumpRank(*best, trump)
 		if cTR >= 0 && bTR >= 0 {
 			if cTR > bTR {
-				best = c
+				best = &hand[i]
 			}
 		} else if cTR < 0 && bTR < 0 {
-			if card.NonTrumpRank(c) > card.NonTrumpRank(best) {
-				best = c
+			if card.NonTrumpRank(c) > card.NonTrumpRank(*best) {
+				best = &hand[i]
 			}
 		} else if cTR >= 0 {
-			best = c
+			best = &hand[i]
 		}
 	}
-	return best
+	if best == nil {
+		return lowestCard(hand, trump)
+	}
+	return *best
 }
 
 func (s *StandardStrategy) pepperOpponentLead(hand []card.Card, trump card.Suit) card.Card {
@@ -1061,9 +1058,8 @@ func (s *StandardStrategy) pepperOpponentLead(hand []card.Card, trump card.Suit)
 	if c, ok := highestOffSuit(hand, trump); ok {
 		return c
 	}
-	trumpCards := filterTrump(hand, trump)
-	if len(trumpCards) > 0 {
-		return highestTrump(trumpCards, trump)
+	if c, ok := highestTrumpInHand(hand, trump); ok {
+		return c
 	}
 	return hand[0]
 }
@@ -1081,11 +1077,11 @@ func (s *StandardStrategy) pepperOpponentFollow(hand []card.Card, state game.Tri
 	winTR := card.TrumpRank(winCard, trump)
 	ledSuit := trick.LedSuit()
 
-	var winners []card.Card
-	for _, c := range hand {
+	var best *card.Card
+	for i, c := range hand {
 		tr := card.TrumpRank(c, trump)
 		effSuit := card.EffectiveSuit(c, trump)
-		var beats bool
+		beats := false
 		if winTR >= 0 {
 			beats = tr > winTR
 		} else {
@@ -1095,30 +1091,31 @@ func (s *StandardStrategy) pepperOpponentFollow(hand []card.Card, state game.Tri
 				beats = true
 			}
 		}
-		if beats {
-			winners = append(winners, c)
+		if !beats {
+			continue
 		}
-	}
-	if len(winners) == 0 {
-		return lowestCard(hand, trump)
-	}
-	best := winners[0]
-	for _, c := range winners[1:] {
-		cTR := card.TrumpRank(c, trump)
-		bTR := card.TrumpRank(best, trump)
+		if best == nil {
+			best = &hand[i]
+			continue
+		}
+		cTR := tr
+		bTR := card.TrumpRank(*best, trump)
 		if cTR >= 0 && bTR >= 0 {
 			if cTR > bTR {
-				best = c
+				best = &hand[i]
 			}
 		} else if cTR < 0 && bTR < 0 {
-			if card.NonTrumpRank(c) > card.NonTrumpRank(best) {
-				best = c
+			if card.NonTrumpRank(c) > card.NonTrumpRank(*best) {
+				best = &hand[i]
 			}
 		} else if cTR >= 0 {
-			best = c
+			best = &hand[i]
 		}
 	}
-	return best
+	if best == nil {
+		return lowestCard(hand, trump)
+	}
+	return *best
 }
 
 // --- Pepper exchange ---
@@ -1132,20 +1129,76 @@ func (s *StandardStrategy) GivePepper(seat int, hand []card.Card, trump card.Sui
 }
 
 func (s *StandardStrategy) PepperDiscard(seat int, hand []card.Card, trump card.Suit, received [2]card.Card) [2]card.Card {
+	// Try to find 2 lowest non-trump-non-ace cards first (if PepperDiscardKeepAces is set).
 	if s.cfg.PepperDiscardKeepAces {
-		nonTrumpNonAce := filterNonTrumpNonAce(hand, trump)
-		if len(nonTrumpNonAce) >= 2 {
-			sorted := sortByRankAsc(nonTrumpNonAce)
-			return [2]card.Card{sorted[0], sorted[1]}
+		if a, b, ok := twoLowestByNonTrumpRank(hand, trump, true); ok {
+			return [2]card.Card{a, b}
 		}
 	}
-	nonTrump := filterNonTrump(hand, trump)
-	if len(nonTrump) >= 2 {
-		sorted := sortByRankAsc(nonTrump)
-		return [2]card.Card{sorted[0], sorted[1]}
+	// Fall back to 2 lowest non-trump (aces included).
+	if a, b, ok := twoLowestByNonTrumpRank(hand, trump, false); ok {
+		return [2]card.Card{a, b}
 	}
-	sorted := sortByTrumpRankAsc(hand, trump)
-	return [2]card.Card{sorted[0], sorted[1]}
+	// All trump — discard 2 lowest trump.
+	a, b := twoLowestByTrumpRank(hand, trump)
+	return [2]card.Card{a, b}
+}
+
+// twoLowestByNonTrumpRank finds the 2 lowest non-trump cards in a single pass.
+// If skipAces is true, skips ace-ranked cards.
+// Returns (low1, low2, true) if 2 qualifying cards were found.
+func twoLowestByNonTrumpRank(hand []card.Card, trump card.Suit, skipAces bool) (card.Card, card.Card, bool) {
+	first := card.Card{}
+	firstRank := 100
+	second := card.Card{}
+	secondRank := 100
+	found := 0
+
+	for _, c := range hand {
+		if card.TrumpRank(c, trump) >= 0 {
+			continue
+		}
+		if skipAces && c.Rank == card.Ace {
+			continue
+		}
+		nr := card.NonTrumpRank(c)
+		if nr < firstRank {
+			second, secondRank = first, firstRank
+			first, firstRank = c, nr
+			if found < 2 {
+				found++
+			}
+		} else if nr < secondRank {
+			second, secondRank = c, nr
+			if found < 2 {
+				found++
+			}
+		}
+	}
+	return first, second, found == 2
+}
+
+// twoLowestByTrumpRank finds the 2 lowest trump cards in a single pass.
+// Assumes hand contains at least 2 trump cards.
+func twoLowestByTrumpRank(hand []card.Card, trump card.Suit) (card.Card, card.Card) {
+	first := card.Card{}
+	firstRank := 100
+	second := card.Card{}
+	secondRank := 100
+
+	for _, c := range hand {
+		tr := card.TrumpRank(c, trump)
+		if tr < 0 {
+			continue
+		}
+		if tr < firstRank {
+			second, secondRank = first, firstRank
+			first, firstRank = c, tr
+		} else if tr < secondRank {
+			second, secondRank = c, tr
+		}
+	}
+	return first, second
 }
 
 // --- Helpers ---
@@ -1188,6 +1241,36 @@ func highestTrump(trumpCards []card.Card, trump card.Suit) card.Card {
 		}
 	}
 	return best
+}
+
+// highestTrumpInHand returns the highest trump card in hand without allocating.
+func highestTrumpInHand(hand []card.Card, trump card.Suit) (card.Card, bool) {
+	bestRank := -1
+	best := card.Card{}
+	for _, c := range hand {
+		tr := card.TrumpRank(c, trump)
+		if tr > bestRank {
+			bestRank = tr
+			best = c
+		}
+	}
+	return best, bestRank >= 0
+}
+
+// lowestTrumpInHand returns the lowest trump card in hand without allocating.
+func lowestTrumpInHand(hand []card.Card, trump card.Suit) (card.Card, bool) {
+	bestRank := 100
+	best := card.Card{}
+	found := false
+	for _, c := range hand {
+		tr := card.TrumpRank(c, trump)
+		if tr >= 0 && tr < bestRank {
+			bestRank = tr
+			best = c
+			found = true
+		}
+	}
+	return best, found
 }
 
 func highestOffSuit(hand []card.Card, trump card.Suit) (card.Card, bool) {
@@ -1235,21 +1318,9 @@ func lowestCard(hand []card.Card, trump card.Suit) card.Card {
 	return best
 }
 
-func lowestWinner(hand []card.Card, trick *game.Trick, trump card.Suit) *card.Card {
-	winSeat := trick.Winner()
-	var winCard card.Card
-	for _, pc := range trick.Cards {
-		if pc.Seat == winSeat {
-			winCard = pc.Card
-			break
-		}
-	}
-	winTR := card.TrumpRank(winCard, trump)
-	winNR := card.NonTrumpRank(winCard)
-	ledSuit := trick.LedSuit()
-
-	var candidates []card.Card
-	for _, c := range hand {
+func lowestWinner(hand []card.Card, winCard card.Card, winTR, winNR int, ledSuit card.Suit, trump card.Suit) *card.Card {
+	var best *card.Card
+	for i, c := range hand {
 		tr := card.TrumpRank(c, trump)
 		effSuit := card.EffectiveSuit(c, trump)
 		beats := false
@@ -1262,45 +1333,31 @@ func lowestWinner(hand []card.Card, trick *game.Trick, trump card.Suit) *card.Ca
 				beats = true
 			}
 		}
-		if beats {
-			candidates = append(candidates, c)
+		if !beats {
+			continue
 		}
-	}
-	if len(candidates) == 0 {
-		return nil
-	}
-	best := candidates[0]
-	for _, c := range candidates[1:] {
-		cTR := card.TrumpRank(c, trump)
-		bTR := card.TrumpRank(best, trump)
+		if best == nil {
+			best = &hand[i]
+			continue
+		}
+		cTR := tr
+		bTR := card.TrumpRank(*best, trump)
 		if cTR >= 0 && bTR >= 0 {
 			if cTR < bTR {
-				best = c
+				best = &hand[i]
 			}
 		} else if cTR < 0 && bTR < 0 {
-			if card.NonTrumpRank(c) < card.NonTrumpRank(best) {
-				best = c
+			if card.NonTrumpRank(c) < card.NonTrumpRank(*best) {
+				best = &hand[i]
 			}
 		}
 	}
-	return &best
+	return best
 }
 
-func highestWinner(hand []card.Card, trick *game.Trick, trump card.Suit) *card.Card {
-	winSeat := trick.Winner()
-	var winCard card.Card
-	for _, pc := range trick.Cards {
-		if pc.Seat == winSeat {
-			winCard = pc.Card
-			break
-		}
-	}
-	winTR := card.TrumpRank(winCard, trump)
-	winNR := card.NonTrumpRank(winCard)
-	ledSuit := trick.LedSuit()
-
-	var candidates []card.Card
-	for _, c := range hand {
+func highestWinner(hand []card.Card, winCard card.Card, winTR, winNR int, ledSuit card.Suit, trump card.Suit) *card.Card {
+	var best *card.Card
+	for i, c := range hand {
 		tr := card.TrumpRank(c, trump)
 		effSuit := card.EffectiveSuit(c, trump)
 		beats := false
@@ -1313,30 +1370,28 @@ func highestWinner(hand []card.Card, trick *game.Trick, trump card.Suit) *card.C
 				beats = true
 			}
 		}
-		if beats {
-			candidates = append(candidates, c)
+		if !beats {
+			continue
 		}
-	}
-	if len(candidates) == 0 {
-		return nil
-	}
-	best := candidates[0]
-	for _, c := range candidates[1:] {
-		cTR := card.TrumpRank(c, trump)
-		bTR := card.TrumpRank(best, trump)
+		if best == nil {
+			best = &hand[i]
+			continue
+		}
+		cTR := tr
+		bTR := card.TrumpRank(*best, trump)
 		if cTR >= 0 && bTR >= 0 {
 			if cTR > bTR {
-				best = c
+				best = &hand[i]
 			}
 		} else if cTR < 0 && bTR < 0 {
-			if card.NonTrumpRank(c) > card.NonTrumpRank(best) {
-				best = c
+			if card.NonTrumpRank(c) > card.NonTrumpRank(*best) {
+				best = &hand[i]
 			}
 		} else if cTR >= 0 {
-			best = c
+			best = &hand[i]
 		}
 	}
-	return &best
+	return best
 }
 
 func offSuitAce(hand []card.Card, trump card.Suit) (card.Card, bool) {
@@ -1384,34 +1439,41 @@ func lowestTrump(trumpCards []card.Card, trump card.Suit) card.Card {
 }
 
 func shortSuitLead(hand []card.Card, trump card.Suit) (card.Card, bool) {
-	suitCounts := map[card.Suit][]card.Card{}
+	// Fixed-size arrays indexed by Suit value (0=Spades,1=Clubs,2=Hearts,3=Diamonds).
+	// Tracks count and lowest card per non-trump suit — no allocation.
+	var counts [4]int
+	var lowest [4]card.Card
+	var lowestRank [4]int
+	for i := range lowestRank {
+		lowestRank[i] = 99
+	}
+
 	for _, c := range hand {
 		eff := card.EffectiveSuit(c, trump)
-		if eff != trump {
-			suitCounts[eff] = append(suitCounts[eff], c)
+		if eff == trump {
+			continue
+		}
+		idx := int(eff)
+		counts[idx]++
+		nr := card.NonTrumpRank(c)
+		if nr < lowestRank[idx] {
+			lowestRank[idx] = nr
+			lowest[idx] = c
 		}
 	}
-	var bestSuit card.Suit
+
+	bestIdx := -1
 	bestLen := 99
-	found := false
-	for s, cards := range suitCounts {
-		if len(cards) > 0 && len(cards) < bestLen {
-			bestLen = len(cards)
-			bestSuit = s
-			found = true
+	for i, n := range counts {
+		if n > 0 && n < bestLen {
+			bestLen = n
+			bestIdx = i
 		}
 	}
-	if !found {
+	if bestIdx < 0 {
 		return card.Card{}, false
 	}
-	cards := suitCounts[bestSuit]
-	low := cards[0]
-	for _, c := range cards[1:] {
-		if card.NonTrumpRank(c) < card.NonTrumpRank(low) {
-			low = c
-		}
-	}
-	return low, true
+	return lowest[bestIdx], true
 }
 
 func sortByRankAsc(hand []card.Card) []card.Card {

@@ -4,8 +4,16 @@ iters/
 
 # Compiled binaries (anchored to root so cmd/ subdirs are not excluded)
 /collect
+/collect-bid
 /simulate
 /botserver
+bin/
+*.test
+
+# Backup model weights
+*_prev.json
+*_prev2.json
+*.iter*_backup
 
 # Logs
 *.log

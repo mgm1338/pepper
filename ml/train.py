@@ -19,13 +19,15 @@ def main():
     parser = argparse.ArgumentParser(description="Train MLP for pepper card play")
     parser.add_argument("--data",    default="training.csv",    help="Input CSV from cmd/collect")
     parser.add_argument("--out",     default="model_weights.json", help="Output weights JSON for Go")
-    parser.add_argument("--epochs",  type=int,   default=30,    help="Training epochs")
-    parser.add_argument("--batch",   type=int,   default=4096,  help="Mini-batch size")
-    parser.add_argument("--lr",      type=float, default=1e-3,  help="Adam learning rate")
-    parser.add_argument("--val",     type=float, default=0.1,   help="Validation fraction (rows from end)")
-    parser.add_argument("--h1",      type=int,   default=128,   help="Hidden layer 1 size")
-    parser.add_argument("--h2",      type=int,   default=64,    help="Hidden layer 2 size")
-    parser.add_argument("--wd",      type=float, default=1e-4,  help="L2 weight decay")
+    parser.add_argument("--epochs",   type=int,   default=100,   help="Max training epochs (early-stops via plateau scheduler)")
+    parser.add_argument("--batch",    type=int,   default=4096,  help="Mini-batch size")
+    parser.add_argument("--lr",       type=float, default=1e-3,  help="Adam learning rate")
+    parser.add_argument("--val",      type=float, default=0.1,   help="Validation fraction (rows from end)")
+    parser.add_argument("--h1",       type=int,   default=128,   help="Hidden layer 1 size")
+    parser.add_argument("--h2",       type=int,   default=64,    help="Hidden layer 2 size")
+    parser.add_argument("--wd",       type=float, default=1e-4,  help="L2 weight decay")
+    parser.add_argument("--patience", type=int,   default=5,     help="ReduceLROnPlateau patience (epochs)")
+    parser.add_argument("--min-lr",   type=float, default=1e-6,  help="Stop training when LR drops below this")
     parser.add_argument("--target",  default="score_delta",     help="Target column")
     parser.add_argument("--chunk",   type=int,   default=500_000, help="CSV read chunk size (rows)")
     parser.add_argument("--seed",    type=int,   default=42)
@@ -48,7 +50,7 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    META = {"hand_id", "trick_num", "seat", "is_bidding_team", "score_delta", "made_bid_rate"}
+    META = {"hand_id", "trick_num", "seat", "is_bidding_team", "score_delta", "made_bid_rate", "bid_level"}
 
     # --- Pass 1: count rows and compute target stats ---
     t0 = time.time()
@@ -93,15 +95,15 @@ def main():
     )
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model:  {n_feat} → {args.h1} → {args.h2} → 1  ({n_params:,} params)")
-    print(f"Config: lr={args.lr}  wd={args.wd}  batch={args.batch}  epochs={args.epochs}")
+    print(f"Config: lr={args.lr}  wd={args.wd}  batch={args.batch}  max_epochs={args.epochs}  patience={args.patience}")
     print()
-    print(f"{'Epoch':>6}  {'Train MSE':>10}  {'Val MSE':>10}  {'Val RMSE':>10}  {'Time':>6}")
-    print("-" * 52)
+    print(f"{'Epoch':>6}  {'Train MSE':>10}  {'Val MSE':>10}  {'Val RMSE':>10}  {'LR':>8}  {'Time':>6}")
+    print("-" * 62)
     sys.stdout.flush()
 
-    opt      = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    loss_fn  = nn.MSELoss()
+    opt       = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=args.patience, factor=0.5, min_lr=args.min_lr)
+    loss_fn   = nn.MSELoss()
 
     best_val   = float("inf")
     best_state = None
@@ -182,13 +184,14 @@ def main():
 
             row_offset = chunk_end
 
-        scheduler.step()
-
         if train_n > 0:
             train_loss /= train_n
         if val_n > 0:
             val_loss /= val_n
         val_rmse = (val_loss ** 0.5) * y_std
+
+        scheduler.step(val_loss)
+        current_lr = opt.param_groups[0]['lr']
 
         marker = " ◀" if val_loss < best_val else ""
         if val_loss < best_val:
@@ -196,8 +199,13 @@ def main():
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
 
         elapsed = time.time() - t_ep
-        print(f"{epoch:>6}  {train_loss:>10.6f}  {val_loss:>10.6f}  {val_rmse:>9.4f}  {elapsed:>5.1f}s{marker}")
+        print(f"{epoch:>6}  {train_loss:>10.6f}  {val_loss:>10.6f}  {val_rmse:>9.4f}  {current_lr:>8.2e}  {elapsed:>5.1f}s{marker}")
         sys.stdout.flush()
+
+        # Early stop when LR has decayed to minimum.
+        if current_lr <= args.min_lr * 1.1:
+            print(f"  Early stop: LR={current_lr:.2e} reached minimum.")
+            break
 
     print()
     print(f"Best val MSE:  {best_val:.6f}  (RMSE ≈ {(best_val**0.5)*y_std:.4f} score points)")

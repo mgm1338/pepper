@@ -20,7 +20,8 @@ func main() {
 	minRows    := flag.Int("min", 500, "minimum hand samples to show in table")
 	workers    := flag.Int("workers", 6, "parallel workers for table run")
 	checkpoint := flag.Int("checkpoint", 100000, "write CSV checkpoint every N games")
-	modelPath  := flag.String("model", "", "path to model_weights.json; runs MLP vs Balanced paired eval")
+	modelPath    := flag.String("model", "", "path to model_weights.json; runs MLP vs Balanced paired eval")
+	bidModelPath := flag.String("bid-model", "", "path to bid_model_weights.json; combined with -model for full MLP eval")
 	flag.Parse()
 
 	if *modelPath != "" {
@@ -28,10 +29,21 @@ func main() {
 		if err != nil {
 			log.Fatalf("load MLP: %v", err)
 		}
+		var bidModel *ml.BidMLP
+		if *bidModelPath != "" {
+			bidModel, err = ml.LoadBidMLP(*bidModelPath)
+			if err != nil {
+				log.Fatalf("load bid MLP: %v", err)
+			}
+		}
 		mlpFactory := func(rng *rand.Rand) [6]game.Strategy {
 			var strats [6]game.Strategy
 			for i := range strats {
-				strats[i] = mlstrategy.NewMLPStrategy(model, strategy.Balanced)
+				s := mlstrategy.NewMLPStrategy(model, strategy.Balanced)
+				if bidModel != nil {
+					s = s.WithBidModel(bidModel)
+				}
+				strats[i] = s
 			}
 			return strats
 		}

@@ -275,6 +275,10 @@ func RunPairedHands(n int, factoryA, factoryB StrategyFactory, seed int64) Paire
 
 		total += rA.ScoreDelta[0] - rB.ScoreDelta[0]
 		dealer = (dealer + 1) % 6
+
+		if (i+1)%50000 == 0 {
+			fmt.Printf("  %d / %d hands  (running avg: %+.4f pts/hand)\n", i+1, n, float64(total)/float64(i+1))
+		}
 	}
 
 	avg := 0.0
