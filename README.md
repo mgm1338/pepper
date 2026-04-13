@@ -150,7 +150,7 @@ The bot server supports 5 difficulty levels that blend the MLP with the rule-bas
 | 4 | 70% MLP, 30% Balanced | Balanced | Counts cards, plays smart |
 | 5 | 100% MLP | 100% MLP | Optimal AI |
 
-Named bot personalities add character: Peter overbids, Redneck plays aggressively, Gary is cautious, Nick Palmer takes risks, and level-5 bots are named after mathematicians (Tesla, Gauss, Euler, etc.).
+Named bot personalities add character: Peter overbids, Redneck plays aggressively, Gary is cautious, Nick takes risks, and level-5 bots are named after mathematicians (Tesla, Gauss, Euler, etc.).
 
 The `/advice` endpoint provides "Ask Grandpa" functionality: a level-5 AI suggestion for the human player, limited to 2 uses per game.
 
