@@ -1,21 +1,58 @@
 package ml
 
 import (
+	"encoding/binary"
+	"io"
+	"math"
 	"math/rand"
 
 	"github.com/max/pepper/internal/card"
 	"github.com/max/pepper/internal/game"
 )
 
-// BidCollectRow is one training example: a (bid decision point, candidate bid level) pair
-// with the expected score delta for the bidding seat's team averaged over rollouts.
+// BidCollectRow is one training example...
 type BidCollectRow struct {
-	HandID    int
-	Seat      int
-	BidLevel  int // 0=pass, 4-7=normal, 8=pepper
-	Features  [BidTotalLen]float32
-	ScoreDelta float32 // expected score delta for this seat's team
+	HandID     int
+	Seat       int
+	BidLevel   int
+	Features   [BidTotalLen]float32
+	ScoreDelta float32
 }
+
+// WriteBinary writes the row in a compact binary format without reflection.
+func (r BidCollectRow) WriteBinary(w io.Writer) error {
+	var buf [6 + 4*BidTotalLen + 4]byte
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(r.HandID))
+	buf[4] = uint8(r.Seat)
+	buf[5] = uint8(r.BidLevel)
+	off := 6
+	for _, f := range r.Features {
+		binary.LittleEndian.PutUint32(buf[off:off+4], math.Float32bits(f))
+		off += 4
+	}
+	binary.LittleEndian.PutUint32(buf[off:off+4], math.Float32bits(r.ScoreDelta))
+	_, err := w.Write(buf[:])
+	return err
+}
+
+// ReadBinary reads a row from a compact binary format without reflection.
+func (r *BidCollectRow) ReadBinary(rd io.Reader) error {
+	var buf [6 + 4*BidTotalLen + 4]byte
+	if _, err := io.ReadFull(rd, buf[:]); err != nil {
+		return err
+	}
+	r.HandID = int(binary.LittleEndian.Uint32(buf[0:4]))
+	r.Seat = int(buf[4])
+	r.BidLevel = int(buf[5])
+	off := 6
+	for i := 0; i < BidTotalLen; i++ {
+		r.Features[i] = math.Float32frombits(binary.LittleEndian.Uint32(buf[off : off+4]))
+		off += 4
+	}
+	r.ScoreDelta = math.Float32frombits(binary.LittleEndian.Uint32(buf[off : off+4]))
+	return nil
+}
+
 
 // bidPoint captures the state at the moment a seat must decide its bid.
 type bidPoint struct {
@@ -178,7 +215,6 @@ func (dp bidPoint) playHand(
 
 // CollectBidHand runs one complete hand, intercepting each bid decision and
 // evaluating each valid bid option via counterfactual rollouts.
-// For each bid decision point, one BidCollectRow is produced per valid bid level.
 func CollectBidHand(
 	handID int,
 	gs *game.GameState,
@@ -193,20 +229,15 @@ func CollectBidHand(
 
 	currentHigh := 0
 	highSeat := -1
-	// Pre-allocate: up to 6 seats × up to 6 bid levels per seat.
 	rows := make([]BidCollectRow, 0, 6*6)
-	var validBuf []card.Card // reused across all rollouts for this hand
 
 	for i := 1; i <= 6; i++ {
 		seat := (dealer + i) % 6
-
 		isDealerTurn := seat == dealer
 		if isDealerTurn && highSeat == -1 {
-			// Stuck hand — no useful bidding data, just return what we have.
 			break
 		}
 
-		// Build the list of seats that still need to bid after this one.
 		var seatsLeft []int
 		for j := i + 1; j <= 6; j++ {
 			seatsLeft = append(seatsLeft, (dealer+j)%6)
@@ -220,9 +251,11 @@ func CollectBidHand(
 			Scores:      scores,
 		}
 
+		// Capture decision point snapshot.
+		pooledHands := copyHandsPooled(hands)
 		dp := bidPoint{
 			seat:        seat,
-			hands:       copyHands(hands),
+			hands:       *pooledHands,
 			dealer:      dealer,
 			scores:      scores,
 			currentHigh: currentHigh,
@@ -230,14 +263,15 @@ func CollectBidHand(
 			seatsLeft:   seatsLeft,
 		}
 
-		// Extract context features once for this decision point.
 		ctx := BidContext(seat, hands[seat], dealer, currentHigh, highSeat, len(seatsLeft), scores)
 
-		// Evaluate each valid bid level via counterfactual rollouts.
-		for _, bidLevel := range ValidBidLevels(currentHigh) {
+		// Evaluate each bid level sequentially (parallelism is at the worker level).
+		validBids := ValidBidLevels(currentHigh)
+		var rolloutValidBuf []card.Card
+		for _, bidLevel := range validBids {
 			var totalDelta float64
 			for r := 0; r < rollouts; r++ {
-				delta := dp.rollout(bidLevel, rolloutStrat, rng, &validBuf)
+				delta := dp.rollout(bidLevel, rolloutStrat, rng, &rolloutValidBuf)
 				totalDelta += float64(delta)
 			}
 			rows = append(rows, BidCollectRow{
@@ -248,6 +282,7 @@ func CollectBidHand(
 				ScoreDelta: float32(totalDelta / float64(rollouts)),
 			})
 		}
+		releaseHands(pooledHands)
 
 		// Advance bidding state using the base strategy's actual decision.
 		bid := strategies[seat].Bid(seat, bidState)

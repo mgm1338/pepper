@@ -27,6 +27,7 @@ ROLLOUTS=20
 WORKERS=8
 EVAL_HANDS=50000
 BID_EPSILON=0.9    # epsilon-greedy exploration during bid rollouts
+USE_GO=${USE_GO:-false} # Set to true for blazing binary format + Go trainer
 START_ITER=${1:-1}
 MAX_ITER=${2:-20}
 
@@ -83,7 +84,10 @@ for iter in $(seq "$START_ITER" "$MAX_ITER"); do
 
     # --- 1. Collect card data ---
     echo "[1/5] Collecting $HANDS card-play hands (seed=$iter)..."
-    DATA="$ITER_DIR/training.csv"
+    EXT="csv"
+    FORMAT="csv"
+    if [ "$USE_GO" = "true" ]; then EXT="bin"; FORMAT="bin"; fi
+    DATA="$ITER_DIR/training.$EXT"
 
     BID_FLAG=""
     if [ -f bid_model_weights.json ]; then
@@ -97,17 +101,31 @@ for iter in $(seq "$START_ITER" "$MAX_ITER"); do
         -workers "$WORKERS" \
         -seed "$iter" \
         -out "$DATA" \
+        -format "$FORMAT" \
         > "$ITER_DIR/collect.log" 2>&1
-    ROWS=$(wc -l < "$DATA")
-    echo "    Done. Rows: $ROWS"
+    
+    if [ "$FORMAT" = "csv" ]; then
+        ROWS=$(wc -l < "$DATA")
+        echo "    Done. Rows: $ROWS"
+    else
+        echo "    Done. (Binary format)"
+    fi
 
     # --- 2. Train card model ---
     echo "[2/5] Training card model (plateau scheduler, max 100 epochs)..."
     NEW_WEIGHTS="$ITER_DIR/model_weights.json"
-    python3 ml/train.py \
-        --data "$DATA" \
-        --out "$NEW_WEIGHTS" \
-        > "$ITER_DIR/train.log" 2>&1
+    if [ "$USE_GO" = "true" ]; then
+        bin/train \
+            -data "$DATA" \
+            -format "$FORMAT" \
+            -out "$NEW_WEIGHTS" \
+            > "$ITER_DIR/train.log" 2>&1
+    else
+        python3 ml/train.py \
+            --data "$DATA" \
+            --out "$NEW_WEIGHTS" \
+            > "$ITER_DIR/train.log" 2>&1
+    fi
     rm -f "$DATA"
 
     VAL_RMSE=$(grep "Best val MSE" "$ITER_DIR/train.log" | grep -oE 'RMSE ≈ [0-9.]+' | grep -oE '[0-9.]+')
@@ -116,7 +134,10 @@ for iter in $(seq "$START_ITER" "$MAX_ITER"); do
 
     # --- 3. Collect bid data using new card model + epsilon-greedy ---
     echo "[3/5] Collecting $BID_HANDS bid hands (epsilon=$BID_EPSILON, seed=$((iter + 100)))..."
-    BID_DATA="$ITER_DIR/bid_training.csv"
+    BID_EXT="csv"
+    BID_FORMAT="csv"
+    if [ "$USE_GO" = "true" ]; then BID_EXT="bin"; BID_FORMAT="bin"; fi
+    BID_DATA="$ITER_DIR/bid_training.$BID_EXT"
     bin/collect-bid \
         -model "$NEW_WEIGHTS" \
         -n "$BID_HANDS" \
@@ -125,17 +146,31 @@ for iter in $(seq "$START_ITER" "$MAX_ITER"); do
         -seed "$((iter + 100))" \
         -epsilon "$BID_EPSILON" \
         -out "$BID_DATA" \
+        -format "$BID_FORMAT" \
         > "$ITER_DIR/collect_bid.log" 2>&1
-    BID_ROWS=$(wc -l < "$BID_DATA")
-    echo "    Done. Rows: $BID_ROWS"
+    
+    if [ "$BID_FORMAT" = "csv" ]; then
+        BID_ROWS=$(wc -l < "$BID_DATA")
+        echo "    Done. Rows: $BID_ROWS"
+    else
+        echo "    Done. (Binary format)"
+    fi
 
     # --- 4. Train bid model ---
     echo "[4/5] Training bid model (plateau scheduler, max 100 epochs)..."
     NEW_BID_WEIGHTS="$ITER_DIR/bid_model_weights.json"
-    python3 ml/train_bid.py \
-        --data "$BID_DATA" \
-        --out "$NEW_BID_WEIGHTS" \
-        > "$ITER_DIR/train_bid.log" 2>&1
+    if [ "$USE_GO" = "true" ]; then
+        bin/train \
+            -data "$BID_DATA" \
+            -format "$BID_FORMAT" \
+            -out "$NEW_BID_WEIGHTS" \
+            > "$ITER_DIR/train_bid.log" 2>&1
+    else
+        python3 ml/train_bid.py \
+            --data "$BID_DATA" \
+            --out "$NEW_BID_WEIGHTS" \
+            > "$ITER_DIR/train_bid.log" 2>&1
+    fi
     rm -f "$BID_DATA"
 
     BID_RMSE=$(grep "Best val MSE" "$ITER_DIR/train_bid.log" | grep -oE 'RMSE ≈ [0-9.]+' | grep -oE '[0-9.]+')

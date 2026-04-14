@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/csv"
 	"flag"
 	"fmt"
@@ -22,7 +23,8 @@ func main() {
 	rollouts  := flag.Int("rollouts", 10, "counterfactual rollouts per candidate card")
 	workers   := flag.Int("workers", 6, "parallel workers")
 	seed      := flag.Int64("seed", 42, "random seed")
-	out       := flag.String("out", "collect.csv", "output CSV path")
+	out       := flag.String("out", "collect.csv", "output path")
+	format    := flag.String("format", "csv", "output format: csv or bin")
 	modelPath    := flag.String("model", "", "path to model_weights.json; use MLP for play instead of Balanced")
 	bidModelPath := flag.String("bid-model", "", "path to bid_model_weights.json; use bid MLP for bidding")
 	flag.Parse()
@@ -51,9 +53,9 @@ func main() {
 	fmt.Printf("  Rollouts: %d per card\n", *rollouts)
 	fmt.Printf("  Workers:  %d\n", *workers)
 	fmt.Printf("  Seed:     %d\n", *seed)
-	fmt.Printf("  Output:   %s\n\n", *out)
+	fmt.Printf("  Output:   %s (%s)\n\n", *out, *format)
 
-	// Open output file and write CSV header.
+	// Open output file.
 	f, err := os.Create(*out)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cannot create output: %v\n", err)
@@ -61,17 +63,24 @@ func main() {
 	}
 	defer f.Close()
 
-	w := csv.NewWriter(f)
-	header := buildHeader()
-	if err := w.Write(header); err != nil {
-		fmt.Fprintf(os.Stderr, "header write failed: %v\n", err)
-		os.Exit(1)
+	// Use buffered I/O for performance.
+	bufW := bufio.NewWriter(f)
+	defer bufW.Flush()
+
+	var csvW *csv.Writer
+	if *format == "csv" {
+		csvW = csv.NewWriter(bufW)
+		header := buildHeader()
+		if err := csvW.Write(header); err != nil {
+			fmt.Fprintf(os.Stderr, "header write failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	// Channel for rows produced by workers.
 	rowCh := make(chan []ml.CollectRow, *workers*4)
 
-	// Writer goroutine — flushes rows from channel to CSV.
+	// Writer goroutine — flushes rows from channel to output.
 	var writeErr error
 	var writeDone sync.WaitGroup
 	writeDone.Add(1)
@@ -79,14 +88,23 @@ func main() {
 		defer writeDone.Done()
 		for rows := range rowCh {
 			for _, row := range rows {
-				if err := w.Write(encodeRow(row)); err != nil {
-					writeErr = err
-					return
+				if *format == "csv" {
+					if err := csvW.Write(encodeRow(row)); err != nil {
+						writeErr = err
+						return
+					}
+				} else {
+					if err := row.WriteBinary(bufW); err != nil {
+						writeErr = err
+						return
+					}
 				}
 			}
 		}
-		w.Flush()
-		writeErr = w.Error()
+		if csvW != nil {
+			csvW.Flush()
+			writeErr = csvW.Error()
+		}
 	}()
 
 	// Distribute hands across workers.

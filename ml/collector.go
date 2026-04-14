@@ -1,6 +1,9 @@
 package ml
 
 import (
+	"encoding/binary"
+	"io"
+	"math"
 	"math/rand"
 	"sync"
 
@@ -8,16 +11,58 @@ import (
 	"github.com/max/pepper/internal/game"
 )
 
-// CollectRow is one training example: a (decision point, candidate card) pair with
-// the counterfactual outcome of playing that card averaged over rollouts.
+// CollectRow is one training example...
 type CollectRow struct {
 	HandID        int
 	TrickNumber   int
 	Seat          int
 	IsBiddingTeam bool
-	Features      [TotalFeatureLen]float32 // full feature vector including card features
-	ScoreDelta    float32                  // mean score delta for bidding team across rollouts
-	MadeBidRate   float32                  // fraction of rollouts where bid was made
+	Features      [TotalFeatureLen]float32
+	ScoreDelta    float32
+	MadeBidRate   float32
+}
+
+// WriteBinary writes the row in a compact binary format without reflection.
+func (r CollectRow) WriteBinary(w io.Writer) error {
+	var buf [7 + 4*TotalFeatureLen + 8]byte
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(r.HandID))
+	buf[4] = uint8(r.TrickNumber)
+	buf[5] = uint8(r.Seat)
+	if r.IsBiddingTeam { buf[6] = 1 } else { buf[6] = 0 }
+	
+	off := 7
+	for _, f := range r.Features {
+		binary.LittleEndian.PutUint32(buf[off:off+4], math.Float32bits(f))
+		off += 4
+	}
+	binary.LittleEndian.PutUint32(buf[off:off+4], math.Float32bits(r.ScoreDelta))
+	off += 4
+	binary.LittleEndian.PutUint32(buf[off:off+4], math.Float32bits(r.MadeBidRate))
+	
+	_, err := w.Write(buf[:])
+	return err
+}
+
+// ReadBinary reads a row from a compact binary format without reflection.
+func (r *CollectRow) ReadBinary(rd io.Reader) error {
+	var buf [7 + 4*TotalFeatureLen + 8]byte
+	if _, err := io.ReadFull(rd, buf[:]); err != nil {
+		return err
+	}
+	r.HandID = int(binary.LittleEndian.Uint32(buf[0:4]))
+	r.TrickNumber = int(buf[4])
+	r.Seat = int(buf[5])
+	r.IsBiddingTeam = buf[6] == 1
+	
+	off := 7
+	for i := 0; i < TotalFeatureLen; i++ {
+		r.Features[i] = math.Float32frombits(binary.LittleEndian.Uint32(buf[off : off+4]))
+		off += 4
+	}
+	r.ScoreDelta = math.Float32frombits(binary.LittleEndian.Uint32(buf[off : off+4]))
+	off += 4
+	r.MadeBidRate = math.Float32frombits(binary.LittleEndian.Uint32(buf[off : off+4]))
+	return nil
 }
 
 // decisionPoint captures a snapshot of game state at the moment a player must play,
@@ -176,10 +221,36 @@ func (dp decisionPoint) rollout(forcedCard card.Card, rolloutStrat [6]game.Strat
 	return result.ScoreDelta[bidderTeam], result.MadeBid
 }
 
+var handPool = sync.Pool{
+	New: func() interface{} {
+		return new([6][]card.Card)
+	},
+}
+
+var trickSlicePool = sync.Pool{
+	New: func() interface{} {
+		return make([]game.PlayedCard, 0, 6)
+	},
+}
+
+func copyHandsPooled(hands [6][]card.Card) *[6][]card.Card {
+	res := handPool.Get().(*[6][]card.Card)
+	for i, h := range hands {
+		if cap((*res)[i]) < len(h) {
+			(*res)[i] = make([]card.Card, len(h))
+		} else {
+			(*res)[i] = (*res)[i][:len(h)]
+		}
+		copy((*res)[i], h)
+	}
+	return res
+}
+
+func releaseHands(h *[6][]card.Card) {
+	handPool.Put(h)
+}
+
 // CollectHand runs one complete hand and returns counterfactual training rows.
-// For every play decision, each legal card is evaluated via `rollouts` simulations
-// using rolloutStrat for all other seats. The base strategies handle bidding and
-// trump selection; rolloutStrat handles counterfactual play evaluation.
 func CollectHand(
 	handID int,
 	gs *game.GameState,
@@ -201,15 +272,12 @@ func CollectHand(
 		},
 	)
 	if bidResult.IsStuck {
-		return nil // stuck hands don't produce useful play data
+		return nil
 	}
 
 	callerSeat := bidResult.Winner
-
-	// Choose trump.
 	trump := strategies[callerSeat].ChooseTrump(callerSeat, hands[callerSeat])
 
-	// Pepper exchange.
 	var sittingOut [2]int
 	isPepper := bidResult.IsPepper
 	if isPepper {
@@ -227,18 +295,15 @@ func CollectHand(
 	}
 
 	activeSeats := buildActiveSeats(isPepper, callerSeat, sittingOut)
-
-	// Play tricks, intercepting each decision.
 	tricksTaken := [6]int{}
 	leader := callerSeat
 	var history game.HandHistory
 	var rows []CollectRow
-	var rolloutValidBuf []card.Card // reused across all rollouts for this hand
 
 	for t := 0; t < game.TotalTricks; t++ {
 		trick := game.NewTrick(leader, trump)
-
 		leaderIdx := indexInSlice(activeSeats, leader)
+
 		for step := 0; step < len(activeSeats); step++ {
 			seat := activeSeats[(leaderIdx+step)%len(activeSeats)]
 			valid := game.ValidPlays(hands[seat], trick, trump)
@@ -256,10 +321,11 @@ func CollectHand(
 				Hand:        hands[seat],
 			}
 
-			// Build decision point snapshot for counterfactual evaluation.
+			// Capture decision point snapshot.
+			pooledHands := copyHandsPooled(hands)
 			dp := decisionPoint{
 				seat:         seat,
-				hands:        copyHands(hands),
+				hands:        *pooledHands,
 				trick:        copyPlayedCards(trick.Cards),
 				trickNum:     t,
 				tricksTaken:  tricksTaken,
@@ -274,39 +340,54 @@ func CollectHand(
 				seatStep:     step,
 			}
 
-			// Extract shared context features (uses full hand, not filtered valid).
 			ctx := ExtractContext(seat, hands[seat], state, len(activeSeats))
 
-			// Evaluate each legal card via counterfactual rollouts.
+			// Parallelize rollouts for candidates.
+			type candResult struct {
+				c     card.Card
+				delta float64
+				made  int
+			}
+			resCh := make(chan candResult, len(valid))
 			for _, candidate := range valid {
-				var totalDelta float64
-				madeBidCount := 0
-				for r := 0; r < rollouts; r++ {
-					delta, made := dp.rollout(candidate, rolloutStrat, rng, &rolloutValidBuf)
-					totalDelta += float64(delta)
-					if made {
-						madeBidCount++
+				go func(c card.Card) {
+					var totalDelta float64
+					madeBidCount := 0
+					var rolloutValidBuf []card.Card
+					localRNG := rand.New(rand.NewSource(rng.Int63()))
+					for r := 0; r < rollouts; r++ {
+						delta, made := dp.rollout(c, rolloutStrat, localRNG, &rolloutValidBuf)
+						totalDelta += float64(delta)
+						if made {
+							madeBidCount++
+						}
 					}
-				}
+					resCh <- candResult{c, totalDelta, madeBidCount}
+				}(candidate)
+			}
+
+			for range valid {
+				res := <-resCh
 				rows = append(rows, CollectRow{
 					HandID:        handID,
 					TrickNumber:   t,
 					Seat:          seat,
 					IsBiddingTeam: game.TeamOf(seat) == game.TeamOf(callerSeat),
-					Features:      AppendCard(ctx, candidate, trump, hands[seat], trick, &history),
-					ScoreDelta:    float32(totalDelta / float64(rollouts)),
-					MadeBidRate:   float32(madeBidCount) / float32(rollouts),
+					Features:      AppendCard(ctx, res.c, trump, hands[seat], trick, &history),
+					ScoreDelta:    float32(res.delta / float64(rollouts)),
+					MadeBidRate:   float32(res.made) / float32(rollouts),
 				})
 			}
+			releasePlayedCards(dp.trick)
+			releaseHands(pooledHands)
 
-			// Play the actual card using the base strategy.
+			// Play the actual card.
 			chosen := strategies[seat].Play(seat, valid, state)
 			trick.Add(chosen, seat)
 			hands[seat] = dropCardInPlace(hands[seat], chosen)
 		}
 
 		history.RecordTrick(trick.Cards)
-
 		winner := trick.Winner()
 		tricksTaken[winner]++
 		leader = winner
@@ -339,9 +420,19 @@ func copyHands(hands [6][]card.Card) [6][]card.Card {
 }
 
 func copyPlayedCards(pcs []game.PlayedCard) []game.PlayedCard {
-	result := make([]game.PlayedCard, len(pcs))
-	copy(result, pcs)
-	return result
+	if len(pcs) == 0 {
+		return nil
+	}
+	res := trickSlicePool.Get().([]game.PlayedCard)[:0]
+	res = append(res, pcs...)
+	return res
+}
+
+func releasePlayedCards(pcs []game.PlayedCard) {
+	if pcs == nil {
+		return
+	}
+	trickSlicePool.Put(pcs)
 }
 
 func buildActiveSeats(pepperActive bool, callerSeat int, sittingOut [2]int) []int {
