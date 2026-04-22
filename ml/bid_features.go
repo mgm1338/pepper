@@ -10,9 +10,9 @@ import (
 //   17–18 opportunity cost features (who holds the high bid)
 //   19–20 per-bid features appended once per candidate bid level
 const (
-	BidContextLen = 19
+	BidContextLen = 32
 	BidActionLen  = 3
-	BidTotalLen   = BidContextLen + BidActionLen // 22
+	BidTotalLen   = BidContextLen + BidActionLen // 35
 )
 
 // BidFeatureNames provides human-readable column names for the full bid feature vector.
@@ -28,23 +28,40 @@ var BidFeatureNames = [BidTotalLen]string{
 	"suit_dominance",       // (best trump count - 2nd best trump count) / 14
 	"second_trump_count",   // trump count in 2nd best suit / 14
 
-	// Position and bidding state (9–12)
-	"seat_pos_norm",    // position in bidding order / 5  (0=left of dealer, 1.0=dealer)
-	"is_dealer",        // 1 if this seat is the dealer
+	// Extended hand quality (9–13)
+	"high_trump_count",    // trumps ranked king+ in best suit / 14
+	"second_has_right",    // 1 if 2nd best suit has right bower
+	"second_best_rank",    // best trump rank in 2nd suit / 13
+	"off_kings",           // off-suit kings / 3
+	"sister_suit_void",    // 1 if void in same-color non-trump suit (left bower depleted)
+	"sister_suit_singleton", // 1 if singleton in same-color non-trump suit
+
+	// Position and bidding state (15–18)
+	"seat_pos_norm",     // position in bidding order / 5  (0=left of dealer, 1.0=dealer)
+	"is_dealer",         // 1 if this seat is the dealer
 	"current_high_norm", // current high bid / 7  (0 if no bids yet)
-	"no_bids_yet",      // 1 if current_high == 0
+	"no_bids_yet",       // 1 if current_high == 0
 
-	// Score context (13–16)
-	"score_us",         // my team's score / 64
-	"score_them",       // opponent score / 64
-	"score_gap",        // (us - them) / 64  (signed)
-	"closeout_window",  // 1 if either team is at 48+ (within 16 of 64)
+	// Score context (19–22)
+	"score_us",        // my team's score / 64
+	"score_them",      // opponent score / 64
+	"score_gap",       // (us - them) / 64  (signed)
+	"closeout_window", // 1 if either team is at 48+ (within 16 of 64)
 
-	// Opportunity cost context (17–18)
-	"high_bid_is_teammate", // 1 if the current high bid is held by a teammate (passing protects them)
-	"seats_left_norm",      // seats remaining to bid after this one / 5 (0 = last to act)
+	// Bidding history context (23–28)
+	"high_bid_is_teammate",   // 1 if the current high bid is held by a teammate
+	"opponent_holding_high",  // 1 if opponent (not teammate) holds the high bid
+	"seats_left_norm",        // seats remaining to bid after this one / 5
+	"passes_so_far",          // players who have passed so far / 5
+	"partner_has_bid",        // 1 if any teammate has placed a non-pass bid before this seat
+	"last_to_bid_flag",       // 1 if this seat is last to act (dealer, all others passed)
 
-	// Per-bid features (19–21)
+	// Derived hand strength (29–31)
+	"both_bowers",         // 1 if has both right and left bower in best suit (strong pepper signal)
+	"partner_bid_level",   // partner's bid level / 8  (0 if no partner bid)
+	"guaranteed_tricks",   // pre-computed trick estimate (bowers + high trumps + aces + voids) / 8
+
+	// Per-bid features (32–34)
 	"bid_level_norm", // bid / 8  (pass=0, 4=0.5, 5=0.625, 6=0.75, 7=0.875, pepper=1.0)
 	"bid_is_pass",    // 1 if this is a pass
 	"bid_is_pepper",  // 1 if this is a pepper call
@@ -57,20 +74,22 @@ var BidFeatureNames = [BidTotalLen]string{
 // highSeat is the seat holding the current high bid (-1 if no bids yet).
 // seatsLeft is the number of seats still to bid after this one.
 // scores is the current game score.
-func BidContext(seat int, hand []card.Card, dealer int, currentHigh int, highSeat int, seatsLeft int, scores [2]int) [BidContextLen]float32 {
+func BidContext(seat int, hand []card.Card, dealer int, currentHigh int, highSeat int, seatsLeft int, scores [2]int, passesSoFar int, partnerHasBid bool, partnerBidLevel int) [BidContextLen]float32 {
 	var f [BidContextLen]float32
 	i := 0
 
 	// Find the best and second-best trump suit by counting trump cards.
+	// Use a fixed-size array (stack allocated) to avoid heap pressure on hot path.
 	type suitInfo struct {
-		suit     card.Suit
-		count    int
-		hasRight bool
-		hasLeft  bool
-		bestRank int
+		suit      card.Suit
+		count     int
+		hasRight  bool
+		hasLeft   bool
+		bestRank  int
+		highCount int // trumps ranked king+
 	}
 
-	suits := make([]suitInfo, 4)
+	var suits [4]suitInfo
 	for s := 0; s < 4; s++ {
 		suits[s].suit = card.Suit(s)
 		suits[s].bestRank = -1
@@ -89,14 +108,18 @@ func BidContext(seat int, hand []card.Card, dealer int, currentHigh int, highSea
 				} else if card.IsLeftBower(c, card.Suit(s)) {
 					suits[s].hasLeft = true
 				}
+				if tr >= card.TrumpRankKing {
+					suits[s].highCount++
+				}
 			}
 		}
 	}
 
-	// Sort to find best and second-best suit (by trump count, tie-break by bestRank).
+	// Find best and second-best suit (by trump count, tie-break by bestRank).
 	best := suits[0]
 	second := suitInfo{bestRank: -1}
-	for _, si := range suits[1:] {
+	for s := 1; s < 4; s++ {
+		si := suits[s]
 		if si.count > best.count || (si.count == best.count && si.bestRank > best.bestRank) {
 			second = best
 			best = si
@@ -105,26 +128,36 @@ func BidContext(seat int, hand []card.Card, dealer int, currentHigh int, highSea
 		}
 	}
 
-	// Off-suit aces and suit distribution relative to best trump suit.
-	offAces, voids, singletons := 0, 0, 0
+	// Off-suit card counts relative to best trump suit.
+	offAces, offKings, voids, singletons := 0, 0, 0, 0
 	suitCounts := [4]int{}
 	for _, c := range hand {
 		if card.TrumpRank(c, best.suit) < 0 {
 			suitCounts[c.Suit]++
 			if c.Rank == card.Ace {
 				offAces++
+			} else if c.Rank == card.King {
+				offKings++
 			}
 		}
 	}
+	sisterVoid, sisterSingleton := false, false
 	for s := card.Suit(0); s < 4; s++ {
 		if s == best.suit {
 			continue
 		}
+		isSister := card.SameColor(s, best.suit)
 		switch suitCounts[s] {
 		case 0:
 			voids++
+			if isSister {
+				sisterVoid = true
+			}
 		case 1:
 			singletons++
+			if isSister {
+				sisterSingleton = true
+			}
 		}
 	}
 
@@ -159,14 +192,33 @@ func BidContext(seat int, hand []card.Card, dealer int, currentHigh int, highSea
 	f[i] = float32(second.count) / card.TotalTrumpCards
 	i++ // second_trump_count
 
+	// Extended hand quality features.
+	f[i] = float32(best.highCount) / card.TotalTrumpCards
+	i++ // high_trump_count
+	if second.hasRight {
+		f[i] = 1.0
+	}
+	i++ // second_has_right
+	if second.bestRank >= 0 {
+		f[i] = float32(second.bestRank) / card.TrumpRankRight
+	}
+	i++ // second_best_rank
+	f[i] = float32(offKings) / 3.0
+	i++ // off_kings
+	if sisterVoid {
+		f[i] = 1.0
+	}
+	i++ // sister_suit_void
+	if sisterSingleton {
+		f[i] = 1.0
+	}
+	i++ // sister_suit_singleton
+
 	// Position and bidding state.
-	// Bidding order starts left of dealer. Dealer bids last (position 5).
-	// Position in round: 0 = first to act (seat left of dealer), 5 = dealer.
 	pos := (seat - dealer + 6) % 6
 	if pos == 0 {
 		pos = 6 // dealer bids last, re-encode
 	}
-	// Now pos is 1-6 where 1=left of dealer, 6=dealer. Normalize to 0-1.
 	f[i] = float32(pos-1) / 5.0
 	i++ // seat_pos_norm
 	if seat == dealer {
@@ -198,13 +250,55 @@ func BidContext(seat int, hand []card.Card, dealer int, currentHigh int, highSea
 	}
 	i++ // closeout_window
 
-	// Opportunity cost features.
+	// Bidding history context.
 	if highSeat >= 0 && game.TeamOf(highSeat) == game.TeamOf(seat) {
 		f[i] = 1.0
 	}
 	i++ // high_bid_is_teammate
+	if highSeat >= 0 && game.TeamOf(highSeat) != game.TeamOf(seat) {
+		f[i] = 1.0
+	}
+	i++ // opponent_holding_high
 	f[i] = float32(seatsLeft) / 5.0
 	i++ // seats_left_norm
+	f[i] = float32(passesSoFar) / 5.0
+	i++ // passes_so_far
+	if partnerHasBid {
+		f[i] = 1.0
+	}
+	i++ // partner_has_bid
+	if seatsLeft == 0 && seat == dealer {
+		f[i] = 1.0
+	}
+	i++ // last_to_bid_flag
+
+	// Derived hand strength features.
+	if best.hasRight && best.hasLeft {
+		f[i] = 1.0
+	}
+	i++ // both_bowers
+
+	f[i] = float32(partnerBidLevel) / float32(game.TotalTricks)
+	i++ // partner_bid_level
+
+	// guaranteed_tricks: weighted sum of reliable trick sources, normalized by total tricks.
+	// Right bower: ~1.0 trick, left bower: ~0.9, each non-bower high trump (ace/king): ~0.65,
+	// off-suit aces: ~0.6, off-suit kings: ~0.4, voids (ruffing): ~0.5.
+	{
+		gt := 0.0
+		if best.hasRight { gt += 1.0 }
+		if best.hasLeft  { gt += 0.9 }
+		nonBowerHigh := best.highCount
+		if best.hasRight { nonBowerHigh-- }
+		if best.hasLeft  { nonBowerHigh-- }
+		if nonBowerHigh < 0 { nonBowerHigh = 0 }
+		gt += float64(nonBowerHigh) * 0.65
+		gt += float64(offAces) * 0.6
+		gt += float64(offKings) * 0.4
+		gt += float64(voids) * 0.5
+		f[i] = float32(gt / float64(game.TotalTricks))
+	}
+	i++ // guaranteed_tricks
 
 	_ = i // i == BidContextLen here
 	return f

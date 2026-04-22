@@ -99,7 +99,7 @@ func main() {
 		if csvW != nil { csvW.Flush(); writeErr = csvW.Error() }
 	}()
 
-	perWorker := *n / *workers
+	var nextHand atomic.Int64
 	var totalHands atomic.Int64
 	var wg sync.WaitGroup
 
@@ -114,31 +114,44 @@ func main() {
 			var strats [6]game.Strategy
 			var rolloutStrats [6]game.Strategy
 			for s := 0; s < 6; s++ {
-				strats[s] = strategy.NewStandard(strategy.Balanced)
-				var base game.Strategy
 				if cardModel != nil {
-					rollout := mlstrategy.NewMLPStrategy(cardModel.Clone(), strategy.Balanced)
-					if bidModel != nil { rollout = rollout.WithBidModel(bidModel) }
-					base = rollout
+					// On-policy: auction path uses bid MLP so collected data reflects
+					// states the model actually reaches during deployment.
+					stratPlay := mlstrategy.NewMLPStrategy(cardModel.Clone(), strategy.Balanced)
+					if bidModel != nil {
+						stratPlay = stratPlay.WithBidModel(bidModel.Clone())
+					}
+					strats[s] = stratPlay
+
+					rolloutPlay := mlstrategy.NewMLPStrategy(cardModel.Clone(), strategy.Balanced)
+					if bidModel != nil {
+						rolloutPlay = rolloutPlay.WithBidModel(bidModel.Clone())
+					}
+					var rolloutBase game.Strategy = rolloutPlay
+					if *epsilon > 0 {
+						rolloutBase = &epsilonStrategy{inner: rolloutPlay, epsilon: *epsilon, rng: rng}
+					}
+					rolloutStrats[s] = rolloutBase
 				} else {
-					base = strategy.NewStandard(strategy.Balanced)
+					strats[s] = strategy.NewStandard(strategy.Balanced)
+					rolloutStrats[s] = strategy.NewStandard(strategy.Balanced)
 				}
-				if *epsilon > 0 { rolloutStrats[s] = &epsilonStrategy{inner: base, epsilon: *epsilon, rng: rng} } else { rolloutStrats[s] = base }
 			}
 
-			for i := 0; i < perWorker; i++ {
-				handID := wid*perWorker + i
-				rows := ml.CollectBidHand(handID, gs, strats, rolloutStrats, rng, *rollouts)
+			localCount := 0
+			for {
+				handIdx := int(nextHand.Add(1)) - 1
+				if handIdx >= *n { break }
+				rows := ml.CollectBidHand(handIdx, gs, strats, rolloutStrats, rng, *rollouts)
 				if len(rows) > 0 { rowCh <- rows }
 				gs.NextDealer()
-				if gs.Round%50 == 0 {
+				localCount++
+				if localCount%50 == 0 {
 					gs = game.NewGame(rng.Intn(6))
 					gs.Scores[0] = rng.Intn(64); gs.Scores[1] = rng.Intn(64)
 				}
-				if wid == 0 {
-					done := totalHands.Add(1)
-					if done%1000 == 0 { fmt.Printf("  %d / %d hands\n", done, int64(*n)) }
-				} else { totalHands.Add(1) }
+				done := totalHands.Add(1)
+				if done%1000 == 0 { fmt.Printf("  %d / %d hands\n", done, int64(*n)) }
 			}
 		}(wid)
 	}

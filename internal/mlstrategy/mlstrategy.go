@@ -41,17 +41,28 @@ func (s *MLPStrategy) Bid(seat int, state game.BidState) int {
 // bidWithMLP uses the bid MLP to choose the best bid level.
 // Picks the valid bid level that maximizes expected score delta for this seat's team.
 func bidWithMLP(m *ml.BidMLP, seat int, state game.BidState) int {
-	ctx := ml.BidContext(seat, state.Hand, state.DealerSeat, state.CurrentHigh, state.HighSeat, state.SeatsLeft, state.Scores)
+	ctx := ml.BidContext(seat, state.Hand, state.DealerSeat, state.CurrentHigh, state.HighSeat, state.SeatsLeft, state.Scores, state.PassesSoFar, state.PartnerHasBid, state.PartnerBidLevel)
+
+	bids := ml.ValidBidLevels(state.CurrentHigh)
+	n := len(bids)
+	if n == 1 {
+		return bids[0]
+	}
+
+	featFlat := m.BatchFeatBuf
+	for i, bidLevel := range bids {
+		f := ml.AppendBidAction(ctx, bidLevel)
+		copy(featFlat[i*ml.BidTotalLen:], f[:])
+	}
+	scores := m.BatchScoreBuf
+	m.ScoreBatch(n, featFlat[:n*ml.BidTotalLen], scores[:n])
 
 	bestBid := game.PassBid
 	bestScore := float32(-1e30)
-
-	for _, bidLevel := range ml.ValidBidLevels(state.CurrentHigh) {
-		features := ml.AppendBidAction(ctx, bidLevel)
-		score := m.Score(features)
-		if score > bestScore {
-			bestScore = score
-			bestBid = bidLevel
+	for i, bid := range bids {
+		if scores[i] > bestScore {
+			bestScore = scores[i]
+			bestBid = bid
 		}
 	}
 	return bestBid
@@ -75,6 +86,11 @@ func (s *MLPStrategy) Play(seat int, validPlays []card.Card, state game.TrickSta
 		return s.fallback.Play(seat, validPlays, state)
 	}
 
+	// Fast path: only one legal play, no inference needed.
+	if len(validPlays) == 1 {
+		return validPlays[0]
+	}
+
 	// Use the full hand for context features; fall back to validPlays if not set.
 	hand := state.Hand
 	if len(hand) == 0 {
@@ -85,15 +101,19 @@ func (s *MLPStrategy) Play(seat int, validPlays []card.Card, state game.TrickSta
 	const activePlayers = 6
 	ctx := ml.ExtractContext(seat, hand, state, activePlayers)
 	isBidder := game.TeamOf(seat) == game.TeamOf(state.BidderSeat)
+	n := len(validPlays)
+	featFlat := s.model.BatchFeatBuf
+	for i, c := range validPlays {
+		f := ml.AppendCard(ctx, c, state.Trump, hand, state.Trick, state.History)
+		copy(featFlat[i*ml.TotalFeatureLen:], f[:])
+	}
+	scores := s.model.BatchScoreBuf
+	s.model.ScoreBatch(n, featFlat[:n*ml.TotalFeatureLen], scores[:n])
 
 	best := validPlays[0]
 	bestScore := float32(-1e30)
-
-	for _, c := range validPlays {
-		features := ml.AppendCard(ctx, c, state.Trump, hand, state.Trick, state.History)
-		score := s.model.Score(features)
-		// score_delta is from the bidding team's perspective.
-		// Defenders want it low, so flip sign.
+	for i, c := range validPlays {
+		score := scores[i]
 		if !isBidder {
 			score = -score
 		}

@@ -6,7 +6,11 @@ import (
 	"os"
 )
 
+// MaxBidBatch is the maximum number of candidate bids at any decision point.
+const MaxBidBatch = 6
+
 // BidMLP is a trained multi-layer perceptron for bid decision scoring.
+// Not safe for concurrent use — callers sharing across goroutines must Clone() first.
 type BidMLP struct {
 	w       MLPWeights
 	h1      []float32
@@ -17,6 +21,13 @@ type BidMLP struct {
 	flat3h  []float32 // W3H row-major: [H3 * H2], nil for 2-layer models
 	nFeat   int
 	featBuf []float32 // heap-allocated copy of input features — avoids CGo escape
+
+	// Batch scratch buffers for ScoreBatch (sized for MaxBidBatch candidates).
+	batchH1Buf    []float32 // [MaxBidBatch * H1]
+	batchH2Buf    []float32 // [MaxBidBatch * H2]
+	batchH3Buf    []float32 // [MaxBidBatch * H3], nil for 2-layer models
+	BatchFeatBuf  []float32 // [MaxBidBatch * BidTotalLen] — reuse to avoid cgo heap escape
+	BatchScoreBuf []float32 // [MaxBidBatch] — reuse to avoid per-call alloc
 }
 
 func LoadBidMLP(path string) (*BidMLP, error) {
@@ -35,20 +46,60 @@ func LoadBidMLP(path string) (*BidMLP, error) {
 	if w.NFeatures != BidTotalLen {
 		return nil, fmt.Errorf("LoadBidMLP: model expects %d features, bid vector is %d", w.NFeatures, BidTotalLen)
 	}
+	flat1 := flattenJagged(w.W1)
+	flat2 := flattenJagged(w.W2)
+	H1 := len(w.B1)
+	H2 := len(w.B2)
+	nFeat := len(w.W1[0])
 	m := &BidMLP{
-		w:       w,
-		h1:      make([]float32, len(w.B1)),
-		h2:      make([]float32, len(w.B2)),
-		flat1:   flattenJagged(w.W1),
-		flat2:   flattenJagged(w.W2),
-		nFeat:   len(w.W1[0]),
-		featBuf: make([]float32, len(w.W1[0])),
+		w:          w,
+		h1:         make([]float32, H1),
+		h2:         make([]float32, H2),
+		flat1:      flat1,
+		flat2:      flat2,
+		nFeat:      nFeat,
+		featBuf:    make([]float32, nFeat),
+		batchH1Buf:    make([]float32, MaxBidBatch*H1),
+		batchH2Buf:    make([]float32, MaxBidBatch*H2),
+		BatchFeatBuf:  make([]float32, MaxBidBatch*BidTotalLen),
+		BatchScoreBuf: make([]float32, MaxBidBatch),
 	}
 	if len(w.B3H) > 0 {
 		m.h3 = make([]float32, len(w.B3H))
 		m.flat3h = flattenJagged(w.W3H)
+		m.batchH3Buf = make([]float32, MaxBidBatch*len(w.B3H))
 	}
 	return m, nil
+}
+
+// Weights returns the MLPWeights for use with MLPTrainer.LoadWeights.
+func (m *BidMLP) Weights() MLPWeights { return m.w }
+
+// Clone returns a BidMLP with independent scratch buffers but shared (read-only) weights.
+// Required when using one loaded model across multiple goroutines.
+func (m *BidMLP) Clone() *BidMLP {
+	H1 := len(m.h1)
+	H2 := len(m.h2)
+	c := &BidMLP{
+		w:          m.w,
+		flat1:      m.flat1,
+		flat2:      m.flat2,
+		flat3h:     m.flat3h,
+		nFeat:      m.nFeat,
+		h1:         make([]float32, H1),
+		h2:         make([]float32, H2),
+		featBuf:    make([]float32, m.nFeat),
+		batchH1Buf:    make([]float32, MaxBidBatch*H1),
+		batchH2Buf:    make([]float32, MaxBidBatch*H2),
+		BatchFeatBuf:  make([]float32, MaxBidBatch*BidTotalLen),
+		BatchScoreBuf: make([]float32, MaxBidBatch),
+	}
+	if m.h3 != nil {
+		H3 := len(m.h3)
+		c.h3 = make([]float32, H3)
+		c.batchH3Buf = make([]float32, MaxBidBatch*H3)
+	}
+	return c
 }
 
 func (m *BidMLP) Score(features [BidTotalLen]float32) float32 {
@@ -97,6 +148,35 @@ func (m *BidMLP) Score(features [BidTotalLen]float32) float32 {
 	}
 	return out*m.w.YStd + m.w.YMean
 }
+
+// ScoreBatch scores n candidate bid feature vectors in a single cgo call (all layers fused).
+// featFlat must be n*BidTotalLen elements (row-major: features for bid 0, then bid 1, …).
+// out must have capacity >= n.
+func (m *BidMLP) ScoreBatch(n int, featFlat []float32, out []float32) {
+	H1 := len(m.h1)
+	H2 := len(m.h2)
+	H3 := 0
+	var w3h, b3h, h3Buf []float32
+	if m.h3 != nil {
+		H3 = len(m.h3)
+		w3h = m.flat3h
+		b3h = m.w.B3H
+		h3Buf = m.batchH3Buf[:n*H3]
+	}
+	wOut, bOut := m.w.W3, m.w.B3
+	if H3 > 0 {
+		wOut, bOut = m.w.W4, m.w.B4
+	}
+	AccelMLPForwardBatch(
+		n, m.nFeat, H1, H2, H3,
+		featFlat, m.flat1, m.w.B1, m.flat2, m.w.B2,
+		w3h, b3h, wOut, bOut,
+		m.w.YStd, m.w.YMean,
+		m.batchH1Buf[:n*H1], m.batchH2Buf[:n*H2], h3Buf,
+		out[:n],
+	)
+}
+
 
 func (m *BidMLP) scoreGoFallback(features [BidTotalLen]float32) float32 {
 	nFeat := m.nFeat

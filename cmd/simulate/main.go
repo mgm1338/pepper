@@ -20,8 +20,10 @@ func main() {
 	minRows    := flag.Int("min", 500, "minimum hand samples to show in table")
 	workers    := flag.Int("workers", 6, "parallel workers for table run")
 	checkpoint := flag.Int("checkpoint", 100000, "write CSV checkpoint every N games")
-	modelPath    := flag.String("model", "", "path to model_weights.json; runs MLP vs Balanced paired eval")
-	bidModelPath := flag.String("bid-model", "", "path to bid_model_weights.json; combined with -model for full MLP eval")
+	modelPath        := flag.String("model", "", "path to model_weights.json; runs MLP vs Balanced paired eval")
+	bidModelPath     := flag.String("bid-model", "", "path to bid_model_weights.json; combined with -model for full MLP eval")
+	oppModelPath     := flag.String("opponent-model", "", "path to opponent model_weights.json; runs MLP vs MLP instead of vs Balanced")
+	oppBidModelPath  := flag.String("opponent-bid-model", "", "path to opponent bid_model_weights.json")
 	flag.Parse()
 
 	if *modelPath != "" {
@@ -47,21 +49,58 @@ func main() {
 			}
 			return strats
 		}
-		balancedFactory := func(rng *rand.Rand) [6]game.Strategy {
-			var strats [6]game.Strategy
-			for i := range strats {
-				strats[i] = strategy.NewStandard(strategy.Balanced)
+
+		var oppFactory func(*rand.Rand) [6]game.Strategy
+		var oppLabel string
+		if *oppModelPath != "" {
+			oppModel, err := ml.LoadMLP(*oppModelPath)
+			if err != nil {
+				log.Fatalf("load opponent MLP: %v", err)
 			}
-			return strats
-		}
-		fmt.Printf("Paired eval: MLP vs Balanced — %d hands, seed=%d\n\n", *n, *seed)
-		result := sim.RunPairedHands(*n, mlpFactory, balancedFactory, *seed)
-		fmt.Printf("Hands played:       %d\n", result.Hands)
-		fmt.Printf("MLP avg advantage:  %+.4f pts/hand vs Balanced\n", result.AvgAdvantage)
-		if result.AvgAdvantage > 0 {
-			fmt.Printf("Result: MLP is BETTER than Balanced\n")
+			var oppBidModel *ml.BidMLP
+			if *oppBidModelPath != "" {
+				oppBidModel, err = ml.LoadBidMLP(*oppBidModelPath)
+				if err != nil {
+					log.Fatalf("load opponent bid MLP: %v", err)
+				}
+			}
+			oppFactory = func(rng *rand.Rand) [6]game.Strategy {
+				var strats [6]game.Strategy
+				for i := range strats {
+					s := mlstrategy.NewMLPStrategy(oppModel, strategy.Balanced)
+					if oppBidModel != nil {
+						s = s.WithBidModel(oppBidModel)
+					}
+					strats[i] = s
+				}
+				return strats
+			}
+			oppLabel = "prev MLP"
 		} else {
-			fmt.Printf("Result: MLP is WORSE than Balanced\n")
+			oppFactory = func(rng *rand.Rand) [6]game.Strategy {
+				var strats [6]game.Strategy
+				for i := range strats {
+					strats[i] = strategy.NewStandard(strategy.Balanced)
+				}
+				return strats
+			}
+			oppLabel = "Balanced"
+		}
+
+		var result sim.PairedResult
+		if *oppModelPath != "" {
+			fmt.Printf("Head-to-head: new MLP (seats 0,2,4) vs %s (seats 1,3,5) — %d hands, seed=%d\n\n", oppLabel, *n, *seed)
+			result = sim.RunHeadToHead(*n, mlpFactory, oppFactory, *seed)
+		} else {
+			fmt.Printf("Paired eval: MLP vs %s — %d hands, seed=%d\n\n", oppLabel, *n, *seed)
+			result = sim.RunPairedHands(*n, mlpFactory, oppFactory, *seed)
+		}
+		fmt.Printf("Hands played:       %d\n", result.Hands)
+		fmt.Printf("MLP avg advantage:  %+.4f pts/hand vs %s\n", result.AvgAdvantage, oppLabel)
+		if result.AvgAdvantage > 0 {
+			fmt.Printf("Result: MLP is BETTER than %s\n", oppLabel)
+		} else {
+			fmt.Printf("Result: MLP is WORSE than %s\n", oppLabel)
 		}
 		return
 	}

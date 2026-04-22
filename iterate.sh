@@ -18,15 +18,18 @@
 
 set -euo pipefail
 
-# Keep the Go GC from letting the heap balloon into swap during long collect runs.
-export GOGC=25
+# GOMEMLIMIT is the hard cap — GOGC=25 was redundant and caused excessive GC overhead (~21% CPU).
+export GOGC=100
 export GOMEMLIMIT=3GiB
 
 ITERS_DIR="iters"
-ROLLOUTS=20
+ROLLOUTS=5
+ROLLOUT_EPSILON=0.3  # stochastic rollouts for diverse value estimates
+BID_ROLLOUTS=10
 WORKERS=8
-EVAL_HANDS=50000
+EVAL_HANDS=500000
 BID_EPSILON=0.9    # epsilon-greedy exploration during bid rollouts
+CARD_EPSILON=0.2   # epsilon-greedy exploration during card collection
 USE_GO=${USE_GO:-false} # Set to true for blazing binary format + Go trainer
 START_ITER=${1:-1}
 MAX_ITER=${2:-20}
@@ -98,8 +101,10 @@ for iter in $(seq "$START_ITER" "$MAX_ITER"); do
         $BID_FLAG \
         -n "$HANDS" \
         -rollouts "$ROLLOUTS" \
+        -rollout-epsilon "$ROLLOUT_EPSILON" \
         -workers "$WORKERS" \
         -seed "$iter" \
+        -epsilon "$CARD_EPSILON" \
         -out "$DATA" \
         -format "$FORMAT" \
         > "$ITER_DIR/collect.log" 2>&1
@@ -112,12 +117,19 @@ for iter in $(seq "$START_ITER" "$MAX_ITER"); do
     fi
 
     # --- 2. Train card model ---
-    echo "[2/5] Training card model (plateau scheduler, max 100 epochs)..."
+    echo "[2/5] Training card model (stops when LR < 1e-5)..."
     NEW_WEIGHTS="$ITER_DIR/model_weights.json"
+    CARD_WARM=""
+    if [ -f model_weights.json ]; then CARD_WARM="-warm-start model_weights.json"; fi
     if [ "$USE_GO" = "true" ]; then
         bin/train \
             -data "$DATA" \
             -format "$FORMAT" \
+            -h1 128 -h2 64 -h3 32 \
+            -epochs 1000 \
+            -patience 3 \
+            -min-lr 1e-5 \
+            $CARD_WARM \
             -out "$NEW_WEIGHTS" \
             > "$ITER_DIR/train.log" 2>&1
     else
@@ -138,10 +150,15 @@ for iter in $(seq "$START_ITER" "$MAX_ITER"); do
     BID_FORMAT="csv"
     if [ "$USE_GO" = "true" ]; then BID_EXT="bin"; BID_FORMAT="bin"; fi
     BID_DATA="$ITER_DIR/bid_training.$BID_EXT"
+    BID_MODEL_FLAG=""
+    if [ -f bid_model_weights.json ]; then
+        BID_MODEL_FLAG="-bid-model bid_model_weights.json"
+    fi
     bin/collect-bid \
         -model "$NEW_WEIGHTS" \
+        $BID_MODEL_FLAG \
         -n "$BID_HANDS" \
-        -rollouts "$ROLLOUTS" \
+        -rollouts "$BID_ROLLOUTS" \
         -workers "$WORKERS" \
         -seed "$((iter + 100))" \
         -epsilon "$BID_EPSILON" \
@@ -157,12 +174,20 @@ for iter in $(seq "$START_ITER" "$MAX_ITER"); do
     fi
 
     # --- 4. Train bid model ---
-    echo "[4/5] Training bid model (plateau scheduler, max 100 epochs)..."
+    echo "[4/5] Training bid model (stops when LR < 1e-5)..."
     NEW_BID_WEIGHTS="$ITER_DIR/bid_model_weights.json"
+    BID_WARM=""
+    if [ -f bid_model_weights.json ]; then BID_WARM="-warm-start bid_model_weights.json"; fi
     if [ "$USE_GO" = "true" ]; then
         bin/train \
             -data "$BID_DATA" \
             -format "$BID_FORMAT" \
+            -mode bid \
+            -h1 256 -h2 128 -h3 64 \
+            -epochs 1000 \
+            -patience 3 \
+            -min-lr 1e-5 \
+            $BID_WARM \
             -out "$NEW_BID_WEIGHTS" \
             > "$ITER_DIR/train_bid.log" 2>&1
     else
@@ -176,7 +201,7 @@ for iter in $(seq "$START_ITER" "$MAX_ITER"); do
     BID_RMSE=$(grep "Best val MSE" "$ITER_DIR/train_bid.log" | grep -oE 'RMSE ≈ [0-9.]+' | grep -oE '[0-9.]+')
     echo "    Done. Best val RMSE: $BID_RMSE"
 
-    # --- 5. Eval combined vs Balanced + vs previous promoted ---
+    # --- 5. Eval combined vs Balanced + head-to-head vs current promoted ---
     echo "[5/5] Eval: new models vs Balanced ($EVAL_HANDS hands)..."
     EVAL_OUT="$ITER_DIR/eval.txt"
     ./simulate \
@@ -190,21 +215,23 @@ for iter in $(seq "$START_ITER" "$MAX_ITER"); do
     VERDICT=$(grep "^Result:" "$EVAL_OUT" | sed 's/Result: //')
     echo "    vs Balanced: $ADV pts/hand  ($VERDICT)"
 
-    # Also eval new vs current promoted (self-improvement check).
+    # Head-to-head: new vs current promoted models.
     EVAL_VS_PREV="$ITER_DIR/eval_vs_prev.txt"
     ./simulate \
         -model "$NEW_WEIGHTS" \
         -bid-model "$NEW_BID_WEIGHTS" \
+        -opponent-model model_weights.json \
+        -opponent-bid-model bid_model_weights.json \
         -n "$EVAL_HANDS" \
         -seed 1234 \
         > "$EVAL_VS_PREV" 2>&1
     ADV_VS_PREV=$(grep "MLP avg advantage" "$EVAL_VS_PREV" | grep -oE '[+-][0-9.]+')
-    echo "    vs prev promoted: $ADV_VS_PREV pts/hand"
+    echo "    vs prev promoted (head-to-head): $ADV_VS_PREV pts/hand"
 
-    # --- 6. Promote only if beats Balanced baseline ---
+    # --- 6. Promote only if beats current promoted head-to-head ---
     PROMOTED="no"
-    if awk "BEGIN { exit !($ADV > $BEST_SCORE) }"; then
-        echo "    NEW BEST ($ADV > $BEST_SCORE) — promoting both models."
+    if awk "BEGIN { exit !($ADV_VS_PREV > 0) }"; then
+        echo "    NEW BEST (head-to-head: $ADV_VS_PREV > 0) — promoting both models."
         cp model_weights.json     "$ITER_DIR/model_weights_prev.json"
         cp bid_model_weights.json "$ITER_DIR/bid_model_weights_prev.json"
         cp "$NEW_WEIGHTS"         model_weights.json
@@ -213,11 +240,11 @@ for iter in $(seq "$START_ITER" "$MAX_ITER"); do
         echo "$BEST_SCORE" > "$BEST_SCORE_FILE"
         PROMOTED="yes"
     else
-        echo "    No improvement ($ADV <= $BEST_SCORE) — keeping current models."
+        echo "    No improvement (head-to-head: $ADV_VS_PREV <= 0) — keeping current models."
     fi
 
     # Log summary.
-    echo "iter=$iter  hands=$HANDS  bid_hands=$BID_HANDS  card_rmse=$VAL_RMSE  bid_rmse=$BID_RMSE  adv_vs_balanced=$ADV  best=$BEST_SCORE  promoted=$PROMOTED" \
+    echo "iter=$iter  hands=$HANDS  bid_hands=$BID_HANDS  card_rmse=$VAL_RMSE  bid_rmse=$BID_RMSE  adv_vs_balanced=$ADV  adv_vs_prev=$ADV_VS_PREV  best=$BEST_SCORE  promoted=$PROMOTED" \
         >> "$ITERS_DIR/progress.log"
 
     echo ""

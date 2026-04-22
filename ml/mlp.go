@@ -29,8 +29,12 @@ type MLPWeights struct {
 	Hidden3  int         `json:"hidden3"`
 }
 
+// MaxCardBatch is the maximum number of valid plays at any card-play decision point.
+const MaxCardBatch = 8
+
 // MLP is a trained multi-layer perceptron for card-play score prediction.
 // Predicts score_delta (bidding team's perspective) for a given feature vector.
+// Not safe for concurrent use — callers sharing across goroutines must Clone() first.
 type MLP struct {
 	w     MLPWeights
 	h1    []float32 // reusable scratch buffer
@@ -42,6 +46,13 @@ type MLP struct {
 	flat3h []float32 // W3H row-major: [H3 * H2], nil for 2-layer models
 	nFeat  int
 	featBuf []float32 // heap-allocated copy of input features — avoids CGo escape
+
+	// Batch scratch buffers for ScoreBatch (sized for MaxCardBatch candidates).
+	batchH1Buf   []float32 // [MaxCardBatch * H1]
+	batchH2Buf   []float32 // [MaxCardBatch * H2]
+	batchH3Buf   []float32 // [MaxCardBatch * H3], nil for 2-layer models
+	BatchFeatBuf []float32 // [MaxCardBatch * TotalFeatureLen] — reuse to avoid cgo heap escape
+	BatchScoreBuf []float32 // [MaxCardBatch] — reuse to avoid per-call alloc
 }
 
 // flattenJagged converts a jagged [][]float32 matrix to a row-major []float32 slice.
@@ -70,39 +81,88 @@ func LoadMLP(path string) (*MLP, error) {
 	if len(w.W1) == 0 || len(w.W2) == 0 || len(w.W3) == 0 {
 		return nil, fmt.Errorf("LoadMLP: empty weight arrays in %s", path)
 	}
+	flat1 := flattenJagged(w.W1)
+	flat2 := flattenJagged(w.W2)
+	H1 := len(w.B1)
+	H2 := len(w.B2)
+	nFeat := len(w.W1[0])
 	m := &MLP{
-		w:       w,
-		h1:      make([]float32, len(w.B1)),
-		h2:      make([]float32, len(w.B2)),
-		flat1:   flattenJagged(w.W1),
-		flat2:   flattenJagged(w.W2),
-		nFeat:   len(w.W1[0]),
-		featBuf: make([]float32, len(w.W1[0])),
+		w:          w,
+		h1:         make([]float32, H1),
+		h2:         make([]float32, H2),
+		flat1:      flat1,
+		flat2:      flat2,
+		nFeat:      nFeat,
+		featBuf:    make([]float32, nFeat),
+		batchH1Buf:    make([]float32, MaxCardBatch*H1),
+		batchH2Buf:    make([]float32, MaxCardBatch*H2),
+		BatchFeatBuf:  make([]float32, MaxCardBatch*TotalFeatureLen),
+		BatchScoreBuf: make([]float32, MaxCardBatch),
 	}
 	if len(w.B3H) > 0 {
 		m.h3 = make([]float32, len(w.B3H))
 		m.flat3h = flattenJagged(w.W3H)
+		m.batchH3Buf = make([]float32, MaxCardBatch*len(w.B3H))
 	}
 	return m, nil
 }
 
+// Weights returns the MLPWeights for use with MLPTrainer.LoadWeights.
+func (m *MLP) Weights() MLPWeights { return m.w }
+
 // Clone returns a new MLP with the same weights but independent scratch buffers,
 // safe to use concurrently with the original.
 func (m *MLP) Clone() *MLP {
+	H1 := len(m.w.B1)
+	H2 := len(m.w.B2)
 	c := &MLP{
-		w:       m.w,
-		h1:      make([]float32, len(m.w.B1)),
-		h2:      make([]float32, len(m.w.B2)),
-		flat1:   m.flat1,  // shared read-only
-		flat2:   m.flat2,  // shared read-only
-		flat3h:  m.flat3h, // shared read-only
-		nFeat:   m.nFeat,
-		featBuf: make([]float32, m.nFeat),
+		w:          m.w,
+		h1:         make([]float32, H1),
+		h2:         make([]float32, H2),
+		flat1:      m.flat1,  // shared read-only
+		flat2:      m.flat2,  // shared read-only
+		flat3h:     m.flat3h, // shared read-only
+		nFeat:      m.nFeat,
+		featBuf:    make([]float32, m.nFeat),
+		batchH1Buf:    make([]float32, MaxCardBatch*H1),
+		batchH2Buf:    make([]float32, MaxCardBatch*H2),
+		BatchFeatBuf:  make([]float32, MaxCardBatch*TotalFeatureLen),
+		BatchScoreBuf: make([]float32, MaxCardBatch),
 	}
 	if len(m.w.B3H) > 0 {
-		c.h3 = make([]float32, len(m.w.B3H))
+		H3 := len(m.w.B3H)
+		c.h3 = make([]float32, H3)
+		c.batchH3Buf = make([]float32, MaxCardBatch*H3)
 	}
 	return c
+}
+
+// ScoreBatch scores n card feature vectors in a single cgo call (all layers fused).
+// featFlat must be n*TotalFeatureLen elements (row-major).
+// out must have capacity >= n.
+func (m *MLP) ScoreBatch(n int, featFlat []float32, out []float32) {
+	H1 := len(m.h1)
+	H2 := len(m.h2)
+	H3 := 0
+	var w3h, b3h, h3Buf []float32
+	if m.h3 != nil {
+		H3 = len(m.h3)
+		w3h = m.flat3h
+		b3h = m.w.B3H
+		h3Buf = m.batchH3Buf[:n*H3]
+	}
+	wOut, bOut := m.w.W3, m.w.B3
+	if H3 > 0 {
+		wOut, bOut = m.w.W4, m.w.B4
+	}
+	AccelMLPForwardBatch(
+		n, m.nFeat, H1, H2, H3,
+		featFlat, m.flat1, m.w.B1, m.flat2, m.w.B2,
+		w3h, b3h, wOut, bOut,
+		m.w.YStd, m.w.YMean,
+		m.batchH1Buf[:n*H1], m.batchH2Buf[:n*H2], h3Buf,
+		out[:n],
+	)
 }
 
 // Score runs a forward pass and returns the predicted score_delta

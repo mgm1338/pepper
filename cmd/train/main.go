@@ -18,27 +18,33 @@ import (
 )
 
 func main() {
-	dataPath := flag.String("data", "collect.csv", "Input file from cmd/collect")
-	format   := flag.String("format", "csv", "Input format: csv or bin")
-	outPath  := flag.String("out", "model_weights.json", "Output weights JSON")
-	epochs   := flag.Int("epochs", 100, "Max training epochs")
-	batch    := flag.Int("batch", 4096, "Mini-batch size")
-	lr       := flag.Float64("lr", 1e-3, "Adam learning rate")
-	valFrac  := flag.Float64("val", 0.1, "Validation fraction")
-	h1       := flag.Int("h1", 128, "Hidden layer 1 size")
-	h2       := flag.Int("h2", 64, "Hidden layer 2 size")
-	h3       := flag.Int("h3", 0, "Hidden layer 3 size (0=2-layer)")
-	wd       := flag.Float64("wd", 1e-4, "L2 weight decay")
-	patience := flag.Int("patience", 5, "ReduceLROnPlateau patience")
-	minLR    := flag.Float64("min-lr", 1e-6, "Stop when LR drops below this")
-	target   := flag.String("target", "score_delta", "Target column")
-	seed     := flag.Int64("seed", 42, "Random seed")
+	dataPath   := flag.String("data", "collect.csv", "Input file from cmd/collect")
+	format     := flag.String("format", "csv", "Input format: csv or bin")
+	outPath    := flag.String("out", "model_weights.json", "Output weights JSON")
+	warmStart  := flag.String("warm-start", "", "path to JSON weights to warm-start from (skips random init)")
+	epochs     := flag.Int("epochs", 100, "Max training epochs")
+	batch      := flag.Int("batch", 4096, "Mini-batch size")
+	lr         := flag.Float64("lr", 1e-3, "Adam learning rate")
+	valFrac    := flag.Float64("val", 0.1, "Validation fraction")
+	h1         := flag.Int("h1", 128, "Hidden layer 1 size")
+	h2         := flag.Int("h2", 64, "Hidden layer 2 size")
+	h3         := flag.Int("h3", 0, "Hidden layer 3 size (0=2-layer)")
+	wd         := flag.Float64("wd", 1e-4, "L2 weight decay")
+	patience   := flag.Int("patience", 5, "ReduceLROnPlateau patience")
+	minLR      := flag.Float64("min-lr", 1e-6, "Stop when LR drops below this")
+	target     := flag.String("target", "score_delta", "Target column")
+	seed       := flag.Int64("seed", 42, "Random seed")
+	mode       := flag.String("mode", "card", "Training mode: card or bid")
 	flag.Parse()
 
 	rng := rand.New(rand.NewSource(*seed))
 
-	if *format == "bin" {
-		runBinaryStreaming(rng, *dataPath, *outPath, *target, *h1, *h2, *h3,
+	if *format == "bin" && *mode == "bid" {
+		runBidBinaryStreaming(rng, *dataPath, *outPath, *warmStart, *h1, *h2, *h3,
+			*batch, *epochs, *patience, *valFrac,
+			float32(*lr), float32(*wd), float32(*minLR))
+	} else if *format == "bin" {
+		runBinaryStreaming(rng, *dataPath, *outPath, *warmStart, *target, *h1, *h2, *h3,
 			*batch, *epochs, *patience, *valFrac,
 			float32(*lr), float32(*wd), float32(*minLR))
 	} else {
@@ -50,7 +56,7 @@ func main() {
 
 // runBinaryStreaming handles binary format with streaming (no full data in memory).
 // Pass 1: compute stats. Each epoch: re-read file, stream batches.
-func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, target string,
+func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath, target string,
 	h1, h2, h3, batch, epochs, patience int, valFrac float64,
 	lr, wd, minLR float32) {
 
@@ -101,6 +107,17 @@ func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, target string,
 	trainer.ResizeBatch(batch)
 	trainer.W.YMean = yMean
 	trainer.W.YStd = yStd
+
+	if warmStartPath != "" {
+		w, err := ml.LoadMLP(warmStartPath)
+		if err != nil {
+			log.Printf("warm start load failed (%v) — training from scratch", err)
+		} else if wsErr := trainer.LoadWeights(w.Weights()); wsErr != nil {
+			log.Printf("warm start skipped: %v", wsErr)
+		} else {
+			fmt.Printf("  Warm start: %s\n\n", warmStartPath)
+		}
+	}
 
 	bestValLoss := float32(math.Inf(1))
 	var bestWeights ml.MLPWeights
@@ -195,6 +212,190 @@ func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, target string,
 			}
 		}
 		// Flush remaining
+		if batchCount > 0 {
+			processBatch(batchCount, inTrain)
+		}
+		f.Close()
+
+		trainMSE := trainLoss / float32(trainN)
+		valMSE := valLoss / float32(valN)
+		valRMSE := float32(math.Sqrt(float64(valMSE))) * yStd
+
+		marker := ""
+		if valMSE < bestValLoss {
+			bestValLoss = valMSE
+			bestWeights = trainer.Finalize()
+			marker = " ◀"
+			plateauCount = 0
+		} else {
+			plateauCount++
+			if plateauCount >= patience {
+				currentLR *= 0.5
+				plateauCount = 0
+			}
+		}
+		fmt.Printf("%6d  %10.6f  %10.6f  %10.4f  %8.2e  %5.1fs%s\n",
+			epoch, trainMSE, valMSE, valRMSE, currentLR, time.Since(epStart).Seconds(), marker)
+		if currentLR < minLR {
+			fmt.Printf("  Early stop: LR=%.2e reached minimum.\n", currentLR)
+			break
+		}
+	}
+
+	fmt.Printf("\nBest val MSE:  %.6f  (RMSE ≈ %.4f score points)\n",
+		bestValLoss, float32(math.Sqrt(float64(bestValLoss)))*yStd)
+
+	outF, _ := os.Create(outPath)
+	enc := json.NewEncoder(outF)
+	enc.SetIndent("", "  ")
+	enc.Encode(bestWeights)
+	outF.Close()
+	fmt.Printf("Weights saved → %s\n", outPath)
+}
+
+// runBidBinaryStreaming handles binary format for bid training data (BidCollectRow).
+func runBidBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath string,
+	h1, h2, h3, batch, epochs, patience int, valFrac float64,
+	lr, wd, minLR float32) {
+
+	nFeat := ml.BidTotalLen
+	fmt.Printf("Loading %s (format=bin, mode=bid, streaming) ...\n", dataPath)
+	t0 := time.Now()
+
+	// --- Pass 1: count rows and compute target stats ---
+	var nRows int64
+	var tSum, tSum2 float64
+	{
+		f, err := os.Open(dataPath)
+		if err != nil { log.Fatal(err) }
+		rd := bufio.NewReaderSize(f, 1<<20)
+		var row ml.BidCollectRow
+		for {
+			err := row.ReadBinary(rd)
+			if err == io.EOF { break }
+			if err != nil { log.Fatal(err) }
+			tSum += float64(row.ScoreDelta)
+			tSum2 += float64(row.ScoreDelta) * float64(row.ScoreDelta)
+			nRows++
+		}
+		f.Close()
+	}
+
+	yMeanF64 := tSum / float64(nRows)
+	yStdF64 := math.Sqrt(tSum2/float64(nRows) - yMeanF64*yMeanF64)
+	yMean := float32(yMeanF64)
+	yStd := float32(yStdF64)
+
+	nVal := int64(float64(nRows) * valFrac)
+	nTrain := nRows - nVal
+
+	fmt.Printf("  %12d rows total (%v)\n", nRows, time.Since(t0).Round(time.Millisecond))
+	fmt.Printf("  %d features  target=score_delta\n", nFeat)
+	fmt.Printf("  mean=%.4f  std=%.4f\n", yMean, yStd)
+	fmt.Printf("  train=%10d  val=%10d\n\n", nTrain, nVal)
+
+	// --- Setup trainer ---
+	trainer := ml.NewMLPTrainer(nFeat, h1, h2, h3, rng)
+	trainer.ResizeBatch(batch)
+	trainer.W.YMean = yMean
+	trainer.W.YStd = yStd
+
+	if warmStartPath != "" {
+		w, err := ml.LoadBidMLP(warmStartPath)
+		if err != nil {
+			log.Printf("warm start load failed (%v) — training from scratch", err)
+		} else if wsErr := trainer.LoadWeights(w.Weights()); wsErr != nil {
+			log.Printf("warm start skipped: %v", wsErr)
+		} else {
+			fmt.Printf("  Warm start: %s\n\n", warmStartPath)
+		}
+	}
+
+	bestValLoss := float32(math.Inf(1))
+	var bestWeights ml.MLPWeights
+
+	currentLR := lr
+	plateauCount := 0
+	preds := make([]float32, batch)
+
+	fmt.Printf("Model:  %d → %d → %d", nFeat, h1, h2)
+	if h3 > 0 { fmt.Printf(" → %d", h3) }
+	nParams := nFeat*h1 + h1 + h1*h2 + h2
+	if h3 > 0 {
+		nParams += h2*h3 + h3 + h3 + 1
+	} else {
+		nParams += h2 + 1
+	}
+	fmt.Printf(" → 1  (%d params)\n", nParams)
+	fmt.Printf("Config: lr=%.3f  wd=%.4f  batch=%d  max_epochs=%d  patience=%d\n\n",
+		currentLR, wd, batch, epochs, patience)
+
+	fmt.Printf("%6s  %10s  %10s  %10s  %8s  %6s\n", "Epoch", "Train MSE", "Val MSE", "Val RMSE", "LR", "Time")
+	fmt.Println("--------------------------------------------------------------")
+
+	// --- Training loop: stream each epoch ---
+	for epoch := 1; epoch <= epochs; epoch++ {
+		epStart := time.Now()
+
+		f, err := os.Open(dataPath)
+		if err != nil { log.Fatal(err) }
+		rd := bufio.NewReaderSize(f, 1<<20)
+
+		var trainLoss float32
+		var trainN int64
+		var valLoss float32
+		var valN int64
+		batchCount := 0
+		rowIdx := int64(0)
+
+		processBatch := func(n int, isTrain bool) {
+			trainer.ForwardBatch(n, preds[:n])
+			for j := 0; j < n; j++ {
+				diff := preds[j] - trainer.BatchY[j]
+				if isTrain {
+					trainLoss += diff * diff
+				} else {
+					valLoss += diff * diff
+				}
+			}
+			if isTrain {
+				trainN += int64(n)
+				trainer.BackwardBatch(n, preds[:n], trainer.BatchY[:n])
+				trainer.Step(currentLR, wd, n)
+				trainer.ZeroGrad()
+			} else {
+				valN += int64(n)
+			}
+		}
+
+		var row ml.BidCollectRow
+		inTrain := true
+		for {
+			err := row.ReadBinary(rd)
+			if err == io.EOF { break }
+			if err != nil { log.Fatal(err) }
+
+			normTV := (row.ScoreDelta - yMean) / (yStd + 1e-8)
+
+			if inTrain && rowIdx >= nTrain {
+				if batchCount > 0 {
+					processBatch(batchCount, true)
+					batchCount = 0
+				}
+				inTrain = false
+			}
+
+			dstOff := batchCount * nFeat
+			copy(trainer.BatchX[dstOff:dstOff+nFeat], row.Features[:])
+			trainer.BatchY[batchCount] = normTV
+			batchCount++
+			rowIdx++
+
+			if batchCount >= batch {
+				processBatch(batchCount, inTrain)
+				batchCount = 0
+			}
+		}
 		if batchCount > 0 {
 			processBatch(batchCount, inTrain)
 		}

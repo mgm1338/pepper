@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/max/pepper/internal/card"
 	"github.com/max/pepper/internal/game"
 	"github.com/max/pepper/internal/mlstrategy"
 	"github.com/max/pepper/internal/strategy"
@@ -22,11 +23,13 @@ func main() {
 	n         := flag.Int("n", 10000, "number of hands to collect")
 	rollouts  := flag.Int("rollouts", 10, "counterfactual rollouts per candidate card")
 	workers   := flag.Int("workers", 6, "parallel workers")
-	seed      := flag.Int64("seed", 42, "random seed")
-	out       := flag.String("out", "collect.csv", "output path")
-	format    := flag.String("format", "csv", "output format: csv or bin")
+	seed         := flag.Int64("seed", 42, "random seed")
+	out          := flag.String("out", "collect.csv", "output path")
+	format       := flag.String("format", "csv", "output format: csv or bin")
 	modelPath    := flag.String("model", "", "path to model_weights.json; use MLP for play instead of Balanced")
 	bidModelPath := flag.String("bid-model", "", "path to bid_model_weights.json; use bid MLP for bidding")
+	epsilon         := flag.Float64("epsilon", 0.0, "probability of playing a random card (exploration)")
+	rolloutEpsilon  := flag.Float64("rollout-epsilon", 0.0, "probability of random card in rollout strategies")
 	flag.Parse()
 
 	var baseModel *ml.MLP
@@ -53,6 +56,7 @@ func main() {
 	fmt.Printf("  Rollouts: %d per card\n", *rollouts)
 	fmt.Printf("  Workers:  %d\n", *workers)
 	fmt.Printf("  Seed:     %d\n", *seed)
+	fmt.Printf("  Epsilon:  %.2f (play)  %.2f (rollout)\n", *epsilon, *rolloutEpsilon)
 	fmt.Printf("  Output:   %s (%s)\n\n", *out, *format)
 
 	// Open output file.
@@ -128,14 +132,22 @@ func main() {
 				if baseModel != nil {
 					play := mlstrategy.NewMLPStrategy(baseModel.Clone(), strategy.Balanced)
 					if baseBidModel != nil {
-						play = play.WithBidModel(baseBidModel)
+						play = play.WithBidModel(baseBidModel.Clone())
 					}
-					strats[s] = play
+					var playStrat game.Strategy = play
+					if *epsilon > 0 {
+						playStrat = &epsilonStrategy{inner: play, epsilon: *epsilon, rng: rng}
+					}
+					strats[s] = playStrat
 					rollout := mlstrategy.NewMLPStrategy(baseModel.Clone(), strategy.Balanced)
 					if baseBidModel != nil {
-						rollout = rollout.WithBidModel(baseBidModel)
+						rollout = rollout.WithBidModel(baseBidModel.Clone())
 					}
-					rolloutStrats[s] = rollout
+					var rolloutStrat game.Strategy = rollout
+					if *rolloutEpsilon > 0 {
+						rolloutStrat = &epsilonStrategy{inner: rollout, epsilon: *rolloutEpsilon, rng: rng}
+					}
+					rolloutStrats[s] = rolloutStrat
 				} else {
 					strats[s] = strategy.NewStandard(strategy.Balanced)
 					rolloutStrats[s] = strategy.NewStandard(strategy.Balanced)
@@ -180,6 +192,23 @@ func main() {
 	}
 
 	fmt.Printf("\nDone. Data written to %s\n", *out)
+}
+
+type epsilonStrategy struct {
+	inner   game.Strategy
+	epsilon float64
+	rng     *rand.Rand
+}
+
+func (s *epsilonStrategy) Bid(seat int, state game.BidState) int { return s.inner.Bid(seat, state) }
+func (s *epsilonStrategy) ChooseTrump(seat int, hand []card.Card) card.Suit { return s.inner.ChooseTrump(seat, hand) }
+func (s *epsilonStrategy) GivePepper(seat int, hand []card.Card, trump card.Suit) card.Card { return s.inner.GivePepper(seat, hand, trump) }
+func (s *epsilonStrategy) PepperDiscard(seat int, hand []card.Card, trump card.Suit, received [2]card.Card) [2]card.Card { return s.inner.PepperDiscard(seat, hand, trump, received) }
+func (s *epsilonStrategy) Play(seat int, validPlays []card.Card, state game.TrickState) card.Card {
+	if len(validPlays) > 1 && s.rng.Float64() < s.epsilon {
+		return validPlays[s.rng.Intn(len(validPlays))]
+	}
+	return s.inner.Play(seat, validPlays, state)
 }
 
 // buildHeader returns the CSV column names.

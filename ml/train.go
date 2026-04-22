@@ -1,6 +1,7 @@
 package ml
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"sync"
@@ -63,7 +64,9 @@ type MLPTrainer struct {
 	BatchD3 []float32
 	BatchY  []float32 // targets [BatchSize]
 
-	T int64 // Adam step counter
+	T   int64   // Adam step counter
+	BC1 float32 // running beta1^T for Adam bias correction
+	BC2 float32 // running beta2^T for Adam bias correction
 }
 
 func NewMLPTrainer(nFeat, h1, h2, h3 int, rng *rand.Rand) *MLPTrainer {
@@ -74,6 +77,8 @@ func NewMLPTrainer(nFeat, h1, h2, h3 int, rng *rand.Rand) *MLPTrainer {
 			Hidden2:  h2,
 			Hidden3:  h3,
 		},
+		BC1: 1.0,
+		BC2: 1.0,
 	}
 
 	// Initialize weights (Xavier/Glorot)
@@ -448,19 +453,24 @@ func (t *MLPTrainer) ZeroGrad() {
 
 func (t *MLPTrainer) Step(lr, wd float32, batchSize int) {
 	t.T++
-	beta1 := float32(0.9)
-	beta2 := float32(0.999)
-	eps := float32(1e-8)
+	const beta1 = float32(0.9)
+	const beta2 = float32(0.999)
+	const eps = float32(1e-8)
 	invN := 1.0 / float32(batchSize)
+
+	// Advance running products and compute bias corrections once per step.
+	t.BC1 *= beta1
+	t.BC2 *= beta2
+	invBC1 := 1.0 / (1 - t.BC1)
+	invBC2 := 1.0 / (1 - t.BC2)
 
 	update := func(w, g, m1, v1 []float32) {
 		for i := range w {
 			gi := g[i]*invN + wd*w[i]
 			m1[i] = beta1*m1[i] + (1-beta1)*gi
 			v1[i] = beta2*v1[i] + (1-beta2)*gi*gi
-
-			mHat := m1[i] / (1 - float32(math.Pow(float64(beta1), float64(t.T))))
-			vHat := v1[i] / (1 - float32(math.Pow(float64(beta2), float64(t.T))))
+			mHat := m1[i] * invBC1
+			vHat := v1[i] * invBC2
 			w[i] -= lr * mHat / (float32(math.Sqrt(float64(vHat))) + eps)
 		}
 	}
@@ -474,22 +484,16 @@ func (t *MLPTrainer) Step(lr, wd float32, batchSize int) {
 		update(t.F3, t.G_F3, t.M1_F3, t.V1_F3)
 		update(t.W.B3H, t.G_B3, t.M1_B3, t.V1_B3)
 		update(t.F4, t.G_F4, t.M1_F4, t.V1_F4)
-		// Update scalar B4
 		gi := t.G_B4*invN + wd*t.W.B4
 		t.M1_B4 = beta1*t.M1_B4 + (1-beta1)*gi
 		t.V1_B4 = beta2*t.V1_B4 + (1-beta2)*gi*gi
-		mHat := t.M1_B4 / (1 - float32(math.Pow(float64(beta1), float64(t.T))))
-		vHat := t.V1_B4 / (1 - float32(math.Pow(float64(beta2), float64(t.T))))
-		t.W.B4 -= lr * mHat / (float32(math.Sqrt(float64(vHat))) + eps)
+		t.W.B4 -= lr * (t.M1_B4 * invBC1) / (float32(math.Sqrt(float64(t.V1_B4*invBC2))) + eps)
 	} else {
 		update(t.F3, t.G_F3, t.M1_F3, t.V1_F3)
-		// Update scalar B3
 		gi := t.G_B3[0]*invN + wd*t.W.B3
 		t.M1_B3[0] = beta1*t.M1_B3[0] + (1-beta1)*gi
 		t.V1_B3[0] = beta2*t.V1_B3[0] + (1-beta2)*gi*gi
-		mHat := t.M1_B3[0] / (1 - float32(math.Pow(float64(beta1), float64(t.T))))
-		vHat := t.V1_B3[0] / (1 - float32(math.Pow(float64(beta2), float64(t.T))))
-		t.W.B3 -= lr * mHat / (float32(math.Sqrt(float64(vHat))) + eps)
+		t.W.B3 -= lr * (t.M1_B3[0] * invBC1) / (float32(math.Sqrt(float64(t.V1_B3[0]*invBC2))) + eps)
 	}
 }
 
@@ -515,4 +519,41 @@ func (t *MLPTrainer) Finalize() MLPWeights {
 		copy(res.W3, t.F3)
 	}
 	return res
+}
+
+// LoadWeights warm-starts the trainer from a previously saved MLPWeights.
+// Adam optimizer state is kept at zero (fresh momentum for new data).
+// YMean/YStd are NOT copied — caller sets those from current data stats.
+// Returns an error if architectures don't match.
+func (t *MLPTrainer) LoadWeights(w MLPWeights) error {
+	if w.NFeatures != t.W.NFeatures || w.Hidden1 != t.W.Hidden1 || w.Hidden2 != t.W.Hidden2 {
+		return fmt.Errorf("warm start mismatch: model %dx%dx%d, trainer %dx%dx%d",
+			w.NFeatures, w.Hidden1, w.Hidden2,
+			t.W.NFeatures, t.W.Hidden1, t.W.Hidden2)
+	}
+	nFeat := t.W.NFeatures
+	for i, row := range w.W1 {
+		copy(t.F1[i*nFeat:], row)
+	}
+	copy(t.W.B1, w.B1)
+
+	h1 := t.W.Hidden1
+	for i, row := range w.W2 {
+		copy(t.F2[i*h1:], row)
+	}
+	copy(t.W.B2, w.B2)
+
+	if t.W.Hidden3 > 0 {
+		h2 := t.W.Hidden2
+		for i, row := range w.W3H {
+			copy(t.F3[i*h2:], row)
+		}
+		copy(t.W.B3H, w.B3H)
+		copy(t.F4, w.W4)
+		t.W.B4 = w.B4
+	} else {
+		copy(t.F3, w.W3)
+		t.W.B3 = w.B3
+	}
+	return nil
 }

@@ -288,6 +288,61 @@ func RunPairedHands(n int, factoryA, factoryB StrategyFactory, seed int64) Paire
 	return PairedResult{Hands: n, TotalAdvantage: total, AvgAdvantage: avg}
 }
 
+// RunHeadToHead plays n hands twice each — once with factoryA on seats 0,2,4
+// and once with factoryA on seats 1,3,5 — then averages, eliminating seat bias.
+// Returns the per-hand average score advantage of factoryA over factoryB.
+func RunHeadToHead(n int, factoryA, factoryB StrategyFactory, seed int64) PairedResult {
+	rng := rand.New(rand.NewSource(seed))
+	total := 0
+	dealer := 0
+
+	for i := 0; i < n; i++ {
+		hands := card.Deal(rng)
+		gsEven := &game.GameState{Dealer: dealer, Scores: [2]int{0, 0}}
+		gsOdd  := &game.GameState{Dealer: dealer, Scores: [2]int{0, 0}}
+
+		stratsA := factoryA(rng)
+		stratsB := factoryB(rng)
+
+		// Game 1: A on seats 0,2,4 — score from A's perspective (team 0).
+		var mixedEven [6]game.Strategy
+		for seat := 0; seat < 6; seat++ {
+			if seat%2 == 0 {
+				mixedEven[seat] = stratsA[seat]
+			} else {
+				mixedEven[seat] = stratsB[seat]
+			}
+		}
+		rEven := game.PlayHandFrom(gsEven, mixedEven, rng, game.NoopLogger{}, hands, game.BidResult{})
+		advEven := rEven.ScoreDelta[0] - rEven.ScoreDelta[1]
+
+		// Game 2: A on seats 1,3,5 — score from A's perspective (team 1).
+		var mixedOdd [6]game.Strategy
+		for seat := 0; seat < 6; seat++ {
+			if seat%2 == 1 {
+				mixedOdd[seat] = stratsA[seat]
+			} else {
+				mixedOdd[seat] = stratsB[seat]
+			}
+		}
+		rOdd := game.PlayHandFrom(gsOdd, mixedOdd, rng, game.NoopLogger{}, hands, game.BidResult{})
+		advOdd := rOdd.ScoreDelta[1] - rOdd.ScoreDelta[0]
+
+		total += advEven + advOdd
+		dealer = (dealer + 1) % 6
+
+		if (i+1)%50000 == 0 {
+			fmt.Printf("  %d / %d hands  (running avg: %+.4f pts/hand)\n", i+1, n, float64(2*total)/float64(2*(i+1)))
+		}
+	}
+
+	avg := 0.0
+	if n > 0 {
+		avg = float64(total) / float64(n)
+	}
+	return PairedResult{Hands: 2 * n, TotalAdvantage: total, AvgAdvantage: avg}
+}
+
 // NamedFactory pairs a strategy name with a factory function.
 type NamedFactory struct {
 	Name    string

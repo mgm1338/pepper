@@ -85,12 +85,12 @@ type decisionPoint struct {
 }
 
 // handBufPool provides reusable [6][]card.Card arrays to eliminate per-rollout allocations.
-// Each buffer holds 6 slices of capacity 8 (max hand size in Pepper).
+// Cap 10 (not 8) so pepper exchange can append 2 cards to the caller's hand in-place.
 var handBufPool = sync.Pool{
 	New: func() interface{} {
 		buf := new([6][]card.Card)
 		for i := range buf {
-			buf[i] = make([]card.Card, 8)
+			buf[i] = make([]card.Card, 8, 10)
 		}
 		return buf
 	},
@@ -298,7 +298,9 @@ func CollectHand(
 	tricksTaken := [6]int{}
 	leader := callerSeat
 	var history game.HandHistory
-	var rows []CollectRow
+	var validBuf []card.Card
+	rolloutBuf := make([]card.Card, 0, 8)
+	rows := make([]CollectRow, 0, 8*len(activeSeats)*game.TotalTricks)
 
 	for t := 0; t < game.TotalTricks; t++ {
 		trick := game.NewTrick(leader, trump)
@@ -306,7 +308,7 @@ func CollectHand(
 
 		for step := 0; step < len(activeSeats); step++ {
 			seat := activeSeats[(leaderIdx+step)%len(activeSeats)]
-			valid := game.ValidPlays(hands[seat], trick, trump)
+			valid := game.ValidPlaysInto(&validBuf, hands[seat], trick, trump)
 
 			state := game.TrickState{
 				Trick:       trick,
@@ -342,40 +344,25 @@ func CollectHand(
 
 			ctx := ExtractContext(seat, hands[seat], state, len(activeSeats))
 
-			// Parallelize rollouts for candidates.
-			type candResult struct {
-				c     card.Card
-				delta float64
-				made  int
-			}
-			resCh := make(chan candResult, len(valid))
 			for _, candidate := range valid {
-				go func(c card.Card) {
-					var totalDelta float64
-					madeBidCount := 0
-					var rolloutValidBuf []card.Card
-					localRNG := rand.New(rand.NewSource(rng.Int63()))
-					for r := 0; r < rollouts; r++ {
-						delta, made := dp.rollout(c, rolloutStrat, localRNG, &rolloutValidBuf)
-						totalDelta += float64(delta)
-						if made {
-							madeBidCount++
-						}
+				var totalDelta float64
+				madeBidCount := 0
+				rolloutBuf = rolloutBuf[:0]
+				for r := 0; r < rollouts; r++ {
+					delta, made := dp.rollout(candidate, rolloutStrat, rng, &rolloutBuf)
+					totalDelta += float64(delta)
+					if made {
+						madeBidCount++
 					}
-					resCh <- candResult{c, totalDelta, madeBidCount}
-				}(candidate)
-			}
-
-			for range valid {
-				res := <-resCh
+				}
 				rows = append(rows, CollectRow{
 					HandID:        handID,
 					TrickNumber:   t,
 					Seat:          seat,
 					IsBiddingTeam: game.TeamOf(seat) == game.TeamOf(callerSeat),
-					Features:      AppendCard(ctx, res.c, trump, hands[seat], trick, &history),
-					ScoreDelta:    float32(res.delta / float64(rollouts)),
-					MadeBidRate:   float32(res.made) / float32(rollouts),
+					Features:      AppendCard(ctx, candidate, trump, hands[seat], trick, &history),
+					ScoreDelta:    float32(totalDelta / float64(rollouts)),
+					MadeBidRate:   float32(float64(madeBidCount) / float64(rollouts)),
 				})
 			}
 			releasePlayedCards(dp.trick)
@@ -435,18 +422,23 @@ func releasePlayedCards(pcs []game.PlayedCard) {
 	trickSlicePool.Put(pcs)
 }
 
-func buildActiveSeats(pepperActive bool, callerSeat int, sittingOut [2]int) []int {
+// buildActiveSeatsBuf writes active seats into dst (caller-provided, cap>=4).
+// For non-pepper returns allSeats (shared, no alloc). dst is ignored in that case.
+func buildActiveSeatsBuf(pepperActive bool, sittingOut [2]int, dst []int) []int {
 	if !pepperActive {
-		return allSeats // shared read-only slice, no allocation
+		return allSeats
 	}
-	sitting := map[int]bool{sittingOut[0]: true, sittingOut[1]: true}
-	var active []int
+	dst = dst[:0]
 	for i := 0; i < 6; i++ {
-		if !sitting[i] {
-			active = append(active, i)
+		if i != sittingOut[0] && i != sittingOut[1] {
+			dst = append(dst, i)
 		}
 	}
-	return active
+	return dst
+}
+
+func buildActiveSeats(pepperActive bool, callerSeat int, sittingOut [2]int) []int {
+	return buildActiveSeatsBuf(pepperActive, sittingOut, nil)
 }
 
 func indexInSlice(slice []int, val int) int {
