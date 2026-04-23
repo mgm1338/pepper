@@ -78,7 +78,8 @@ func LoadMLP(path string) (*MLP, error) {
 	if err := json.Unmarshal(data, &w); err != nil {
 		return nil, fmt.Errorf("LoadMLP parse: %w", err)
 	}
-	if len(w.W1) == 0 || len(w.W2) == 0 || len(w.W3) == 0 {
+	isThreeLayer := len(w.W3H) > 0
+	if len(w.W1) == 0 || len(w.W2) == 0 || (!isThreeLayer && len(w.W3) == 0) || (isThreeLayer && len(w.W4) == 0) {
 		return nil, fmt.Errorf("LoadMLP: empty weight arrays in %s", path)
 	}
 	flat1 := flattenJagged(w.W1)
