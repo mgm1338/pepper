@@ -61,7 +61,8 @@ func main() {
 			if *oppBidModelPath != "" {
 				oppBidModel, err = ml.LoadBidMLP(*oppBidModelPath)
 				if err != nil {
-					log.Fatalf("load opponent bid MLP: %v", err)
+					log.Printf("opponent bid model incompatible, falling back to Balanced: %v", err)
+					oppBidModel = nil
 				}
 			}
 			oppFactory = func(rng *rand.Rand) [6]game.Strategy {
@@ -125,27 +126,9 @@ func main() {
 
 	configs := []sim.NamedFactory{
 		{
-			Name: "Conservative",
-			Factory: func(rng *rand.Rand) game.Strategy {
-				return strategy.NewStandard(strategy.Conservative)
-			},
-		},
-		{
-			Name: "BalancedV1",
-			Factory: func(rng *rand.Rand) game.Strategy {
-				return strategy.NewStandard(strategy.BalancedV1)
-			},
-		},
-		{
 			Name: "Balanced",
 			Factory: func(rng *rand.Rand) game.Strategy {
 				return strategy.NewStandard(strategy.Balanced)
-			},
-		},
-		{
-			Name: "Aggressive",
-			Factory: func(rng *rand.Rand) game.Strategy {
-				return strategy.NewStandard(strategy.Aggressive)
 			},
 		},
 	}

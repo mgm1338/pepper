@@ -521,6 +521,25 @@ func (t *MLPTrainer) Finalize() MLPWeights {
 	return res
 }
 
+// ResetOutputLayer re-randomizes the output layer weights using Xavier init.
+// Call after LoadWeights to warm-start hidden layers only, letting the output
+// head re-fit to the current iteration's target distribution from scratch.
+func (t *MLPTrainer) ResetOutputLayer(rng *rand.Rand) {
+	if t.W.Hidden3 > 0 {
+		limit := float32(math.Sqrt(6.0 / float64(t.W.Hidden3+1)))
+		for i := range t.F4 {
+			t.F4[i] = rng.Float32()*2*limit - limit
+		}
+		t.W.B4 = 0
+	} else {
+		limit := float32(math.Sqrt(6.0 / float64(t.W.Hidden2+1)))
+		for i := range t.F3 {
+			t.F3[i] = rng.Float32()*2*limit - limit
+		}
+		t.W.B3 = 0
+	}
+}
+
 // LoadWeights warm-starts the trainer from a previously saved MLPWeights.
 // Adam optimizer state is kept at zero (fresh momentum for new data).
 // YMean/YStd are NOT copied — caller sets those from current data stats.

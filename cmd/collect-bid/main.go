@@ -25,11 +25,11 @@ type epsilonStrategy struct {
 	rng     *rand.Rand
 }
 
-func (s *epsilonStrategy) Bid(seat int, state game.BidState) int { return s.inner.Bid(seat, state) }
+func (s *epsilonStrategy) Bid(seat int, state *game.BidState) int { return s.inner.Bid(seat, state) }
 func (s *epsilonStrategy) ChooseTrump(seat int, hand []card.Card) card.Suit { return s.inner.ChooseTrump(seat, hand) }
 func (s *epsilonStrategy) GivePepper(seat int, hand []card.Card, trump card.Suit) card.Card { return s.inner.GivePepper(seat, hand, trump) }
 func (s *epsilonStrategy) PepperDiscard(seat int, hand []card.Card, trump card.Suit, received [2]card.Card) [2]card.Card { return s.inner.PepperDiscard(seat, hand, trump, received) }
-func (s *epsilonStrategy) Play(seat int, validPlays []card.Card, state game.TrickState) card.Card {
+func (s *epsilonStrategy) Play(seat int, validPlays []card.Card, state *game.TrickState) card.Card {
 	if len(validPlays) > 1 && s.rng.Float64() < s.epsilon {
 		return validPlays[s.rng.Intn(len(validPlays))]
 	}
@@ -58,7 +58,10 @@ func main() {
 	if *bidModelPath != "" {
 		var err error
 		bidModel, err = ml.LoadBidMLP(*bidModelPath)
-		if err != nil { log.Fatalf("load bid model: %v", err) }
+		if err != nil {
+			log.Printf("bid model incompatible, falling back to Balanced: %v", err)
+			bidModel = nil
+		}
 	}
 
 	fmt.Printf("Collecting bid training data:\n")
@@ -95,6 +98,7 @@ func main() {
 					if err := row.WriteBinary(bufW); err != nil { writeErr = err; return }
 				}
 			}
+			ml.ReleaseBidRows(rows)
 		}
 		if csvW != nil { csvW.Flush(); writeErr = csvW.Error() }
 	}()
@@ -113,28 +117,26 @@ func main() {
 
 			var strats [6]game.Strategy
 			var rolloutStrats [6]game.Strategy
-			for s := 0; s < 6; s++ {
-				if cardModel != nil {
-					// On-policy: auction path uses bid MLP so collected data reflects
-					// states the model actually reaches during deployment.
-					stratPlay := mlstrategy.NewMLPStrategy(cardModel.Clone(), strategy.Balanced)
-					if bidModel != nil {
-						stratPlay = stratPlay.WithBidModel(bidModel.Clone())
-					}
-					strats[s] = stratPlay
-
-					rolloutPlay := mlstrategy.NewMLPStrategy(cardModel.Clone(), strategy.Balanced)
-					if bidModel != nil {
-						rolloutPlay = rolloutPlay.WithBidModel(bidModel.Clone())
-					}
-					var rolloutBase game.Strategy = rolloutPlay
-					if *epsilon > 0 {
-						rolloutBase = &epsilonStrategy{inner: rolloutPlay, epsilon: *epsilon, rng: rng}
-					}
+			if cardModel != nil {
+				// One card+bid MLP clone per worker — all 6 seats share it since
+				// CollectBidHand runs sequentially within a goroutine.
+				sharedPlay := mlstrategy.NewMLPStrategy(cardModel.Clone(), strategy.Balanced)
+				if bidModel != nil {
+					sharedPlay = sharedPlay.WithBidModel(bidModel.Clone())
+				}
+				var rolloutBase game.Strategy = sharedPlay
+				if *epsilon > 0 {
+					rolloutBase = &epsilonStrategy{inner: sharedPlay, epsilon: *epsilon, rng: rng}
+				}
+				for s := 0; s < 6; s++ {
+					strats[s] = sharedPlay
 					rolloutStrats[s] = rolloutBase
-				} else {
-					strats[s] = strategy.NewStandard(strategy.Balanced)
-					rolloutStrats[s] = strategy.NewStandard(strategy.Balanced)
+				}
+			} else {
+				shared := strategy.NewStandard(strategy.Balanced)
+				for s := 0; s < 6; s++ {
+					strats[s] = shared
+					rolloutStrats[s] = shared
 				}
 			}
 

@@ -93,9 +93,8 @@ type Genome struct {
 }
 
 // ToConfig converts a Genome to a strategy.Config.
-func (g Genome) ToConfig(name string) strategy.Config {
+func (g Genome) ToConfig(_ string) strategy.Config {
 	return strategy.Config{
-		Name:                    name,
 		PartnerTricksEstimate:   g.PartnerTricksEstimate,
 		BidPadding:              g.BidPadding,
 		Bid5Threshold:           g.Bid5Threshold,

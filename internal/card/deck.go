@@ -22,6 +22,34 @@ func Shuffle(cards []Card, rng *rand.Rand) {
 	})
 }
 
+// cachedDeck is the canonical unshuffled pinochle deck, built once at init.
+var cachedDeck [48]Card
+
+func init() {
+	d := NewPinochleDeck()
+	copy(cachedDeck[:], d)
+}
+
+// DealBuf holds scratch memory for alloc-free dealing. Get one from DealBufPool.
+type DealBuf struct {
+	scratch [48]Card
+	slots   [6][8]Card
+}
+
+// DealInto shuffles a copy of the deck into buf and returns 6 hand slices
+// backed by buf.slots. The caller must not release buf back to its pool
+// until it is finished reading from the returned hands.
+func DealInto(buf *DealBuf, rng *rand.Rand) [6][]Card {
+	copy(buf.scratch[:], cachedDeck[:])
+	Shuffle(buf.scratch[:], rng)
+	var hands [6][]Card
+	for i := range hands {
+		copy(buf.slots[i][:], buf.scratch[i*8:(i+1)*8])
+		hands[i] = buf.slots[i][:]
+	}
+	return hands
+}
+
 // Deal shuffles the deck and returns 6 hands of 8 cards each.
 func Deal(rng *rand.Rand) [6][]Card {
 	deck := NewPinochleDeck()

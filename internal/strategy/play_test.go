@@ -28,7 +28,7 @@ func makeTrickMulti(cards []card.Card, trump card.Suit) *game.Trick {
 // trickWinInfo precomputes winner card info from a trick for use with lowestWinner/highestWinner.
 func trickWinInfo(trick *game.Trick, trump card.Suit) (winCard card.Card, winTR, winNR int, ledSuit card.Suit) {
 	winSeat := trick.Winner()
-	for _, pc := range trick.Cards {
+	for _, pc := range trick.Cards[:trick.NCards] {
 		if pc.Seat == winSeat {
 			winCard = pc.Card
 			break
@@ -299,7 +299,7 @@ func TestPepperCallerFollow_returnsHighestWinner(t *testing.T) {
 	trumpNine := card.Card{Suit: spades, Rank: card.Nine, CopyIndex: 0}
 	trumpAce := card.Card{Suit: spades, Rank: card.Ace, CopyIndex: 0}
 	hand := []card.Card{trumpNine, trumpAce}
-	got := s.pepperCallerFollow(hand, state, spades)
+	got := s.pepperCallerFollow(hand, &state, spades)
 	// Should return highest winner (trump ace beats hearts 9).
 	if !got.Equal(trumpAce) {
 		t.Fatalf("pepperCallerFollow = %v, want trumpAce (highest winner)", got)
@@ -316,7 +316,7 @@ func TestPepperCallerFollow_noWinnerReturnsLowest(t *testing.T) {
 		{Suit: card.Hearts, Rank: card.Nine, CopyIndex: 0},
 		{Suit: card.Hearts, Rank: card.Ace, CopyIndex: 0},
 	}
-	got := s.pepperCallerFollow(hand, state, spades)
+	got := s.pepperCallerFollow(hand, &state, spades)
 	// Nothing beats right bower — should return lowestCard (hearts 9 = lowest non-trump).
 	if !got.Equal(card.Card{Suit: card.Hearts, Rank: card.Nine, CopyIndex: 0}) {
 		t.Fatalf("pepperCallerFollow = %v, want heartNine (lowestCard when can't win)", got)
@@ -335,7 +335,7 @@ func TestPepperCallerFollow_prefersTrumpOverSameSuit(t *testing.T) {
 	heartAce := card.Card{Suit: card.Hearts, Rank: card.Ace, CopyIndex: 0}
 	// heartAce first so it becomes initial best, then trumpNine should replace it.
 	hand := []card.Card{heartAce, trumpNine}
-	got := s.pepperCallerFollow(hand, state, spades)
+	got := s.pepperCallerFollow(hand, &state, spades)
 	if !got.Equal(trumpNine) {
 		t.Fatalf("pepperCallerFollow = %v, want trumpNine (trump preferred over same-suit non-trump)", got)
 	}

@@ -13,6 +13,9 @@ func TestMLPScoreFlatMatchesJagged(t *testing.T) {
 	if err != nil {
 		t.Skip("model_weights.json not found:", err)
 	}
+	if m.w.NFeatures != TotalFeatureLen {
+		t.Skipf("model has %d features, current TotalFeatureLen=%d — skipping stale model test", m.w.NFeatures, TotalFeatureLen)
+	}
 
 	rng := rand.New(rand.NewSource(99))
 	for trial := 0; trial < 1000; trial++ {

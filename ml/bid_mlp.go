@@ -103,50 +103,9 @@ func (m *BidMLP) Clone() *BidMLP {
 }
 
 func (m *BidMLP) Score(features [BidTotalLen]float32) float32 {
-	H1 := len(m.h1)
-	H2 := len(m.h2)
-
 	copy(m.featBuf, features[:])
-
-	// h1 = relu(W1 @ features + b1)
-	copy(m.h1, m.w.B1)
-	accelGEMV(H1, m.nFeat, m.flat1, m.featBuf, m.h1)
-	for i, v := range m.h1 {
-		if v < 0 {
-			m.h1[i] = 0
-		}
-	}
-
-	// h2 = relu(W2 @ h1 + b2)
-	copy(m.h2, m.w.B2)
-	accelGEMV(H2, H1, m.flat2, m.h1, m.h2)
-	for i, v := range m.h2 {
-		if v < 0 {
-			m.h2[i] = 0
-		}
-	}
-
-	if m.h3 != nil {
-		H3 := len(m.h3)
-		copy(m.h3, m.w.B3H)
-		accelGEMV(H3, H2, m.flat3h, m.h2, m.h3)
-		for i, v := range m.h3 {
-			if v < 0 {
-				m.h3[i] = 0
-			}
-		}
-		out := m.w.B4
-		for j, hj := range m.h3 {
-			out += m.w.W4[j] * hj
-		}
-		return out*m.w.YStd + m.w.YMean
-	}
-
-	out := m.w.B3
-	for j, hj := range m.h2 {
-		out += m.w.W3[j] * hj
-	}
-	return out*m.w.YStd + m.w.YMean
+	m.ScoreBatch(1, m.featBuf, m.BatchScoreBuf[:1])
+	return m.BatchScoreBuf[0]
 }
 
 // ScoreBatch scores n candidate bid feature vectors in a single cgo call (all layers fused).

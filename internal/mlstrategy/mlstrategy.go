@@ -31,7 +31,7 @@ func (s *MLPStrategy) WithBidModel(bidModel *ml.BidMLP) *MLPStrategy {
 	return s
 }
 
-func (s *MLPStrategy) Bid(seat int, state game.BidState) int {
+func (s *MLPStrategy) Bid(seat int, state *game.BidState) int {
 	if s.bidModel == nil {
 		return s.fallback.Bid(seat, state)
 	}
@@ -40,8 +40,8 @@ func (s *MLPStrategy) Bid(seat int, state game.BidState) int {
 
 // bidWithMLP uses the bid MLP to choose the best bid level.
 // Picks the valid bid level that maximizes expected score delta for this seat's team.
-func bidWithMLP(m *ml.BidMLP, seat int, state game.BidState) int {
-	ctx := ml.BidContext(seat, state.Hand, state.DealerSeat, state.CurrentHigh, state.HighSeat, state.SeatsLeft, state.Scores, state.PassesSoFar, state.PartnerHasBid, state.PartnerBidLevel)
+func bidWithMLP(m *ml.BidMLP, seat int, state *game.BidState) int {
+	ctx := ml.BidContext(seat, state.Hand, state.DealerSeat, state.CurrentHigh, state.HighSeat, state.SeatsLeft, state.Scores, state.PassesSoFar, state.PartnerHasBid, state.PartnerBidLevel, state.AllBids)
 
 	bids := ml.ValidBidLevels(state.CurrentHigh)
 	n := len(bids)
@@ -51,7 +51,7 @@ func bidWithMLP(m *ml.BidMLP, seat int, state game.BidState) int {
 
 	featFlat := m.BatchFeatBuf
 	for i, bidLevel := range bids {
-		f := ml.AppendBidAction(ctx, bidLevel)
+		f := ml.AppendBidAction(ctx, bidLevel, state.CurrentHigh)
 		copy(featFlat[i*ml.BidTotalLen:], f[:])
 	}
 	scores := m.BatchScoreBuf
@@ -80,7 +80,7 @@ func (s *MLPStrategy) PepperDiscard(seat int, hand []card.Card, trump card.Suit,
 	return s.fallback.PepperDiscard(seat, hand, trump, received)
 }
 
-func (s *MLPStrategy) Play(seat int, validPlays []card.Card, state game.TrickState) card.Card {
+func (s *MLPStrategy) Play(seat int, validPlays []card.Card, state *game.TrickState) card.Card {
 	// Pepper play is scripted — fall back to StandardStrategy.
 	if state.BidAmount == game.PepperBid {
 		return s.fallback.Play(seat, validPlays, state)
@@ -99,7 +99,7 @@ func (s *MLPStrategy) Play(seat int, validPlays []card.Card, state game.TrickSta
 
 	// 4 active players for pepper, 6 for normal — always 6 here (pepper handled above).
 	const activePlayers = 6
-	ctx := ml.ExtractContext(seat, hand, state, activePlayers)
+	ctx := ml.ExtractContext(seat, hand, *state, activePlayers)
 	isBidder := game.TeamOf(seat) == game.TeamOf(state.BidderSeat)
 	n := len(validPlays)
 	featFlat := s.model.BatchFeatBuf

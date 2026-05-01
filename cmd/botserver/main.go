@@ -4,6 +4,11 @@
 // POST /bid        { "hand": [...], "bid_state": {...} }          → { "bid": 5 }
 // POST /trump      { "seat": 0, "hand": [...] }                   → { "suit": "H" }
 // POST /play       { "seat": 0, "valid_plays": [...], "state": {...} } → { "card": "JH" }
+//
+// All action endpoints accept optional bot config fields:
+//   "play_style": 0.0–1.0  (0 = pure Balanced, 1 = pure MLP card play)
+//   "bid_style":  0.0–1.0  (0 = pure Balanced, 1 = pure MLP bidding)
+//   "slop":       0.0–1.0  (0 = no mistakes, 1 = maximum randomness)
 package main
 
 import (
@@ -11,7 +16,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 
 	"github.com/max/pepper/internal/card"
@@ -21,97 +25,62 @@ import (
 	"github.com/max/pepper/ml"
 )
 
-// peterStrat holds the special "Peter" personality (created at startup).
-var peterStrat game.Strategy
+var mlpStrat  game.Strategy
+var cardModel *ml.MLP
+var bidModel  *ml.BidMLP
 
-// level45Strat is the half step between levels 4 and 5 (sharp play, Balanced bid).
-var level45Strat game.Strategy
-
-// level46Strat is the bidder variant of 4.5 (sharp bid, Balanced play).
-var level46Strat game.Strategy
-
-// personalityStrats holds named personalities (scientist, aggressive, cautious, risky).
-var personalityStrats map[string]game.Strategy
-
-// stratForRequest returns the strategy for a given level and personality.
-// Level may be 1-5 or 45 (meaning 4.5).
-func stratForRequest(level int, personality string) game.Strategy {
-	if personality != "" {
-		if personality == "peter" {
-			return peterStrat
-		}
-		if s, ok := personalityStrats[personality]; ok {
-			return s
-		}
-	}
-	if level == 45 {
-		return level45Strat
-	}
-	if level == 46 {
-		return level46Strat
-	}
-	if level < 1 || level > 5 {
-		level = defaultLevel
-	}
-	return strategies[level-1]
+func botForConfig(cfg BotConfigJSON) game.Strategy {
+	return strategy.NewBot(strategy.BotConfig{
+		PlayStyle:   cfg.PlayStyle,
+		BidStyle:    cfg.BidStyle,
+		Slop:        cfg.Slop,
+		TrumpMemory: cfg.TrumpMemory,
+		AceMemory:   cfg.AceMemory,
+	}, mlpStrat)
 }
 
-// strategies holds one strategy per difficulty level (index 0 = level 1, index 4 = level 5).
-var strategies [5]game.Strategy
-var defaultLevel int = 5
-
 func main() {
-	addr          := flag.String("addr", ":9090", "listen address")
-	modelPath     := flag.String("model", "", "path to model_weights.json (enables MLP play)")
-	bidModelPath  := flag.String("bid-model", "", "path to bid_model_weights.json (enables MLP bidding)")
-	level         := flag.Int("level", 5, "default difficulty level (1-5)")
+	addr         := flag.String("addr", ":9090", "listen address")
+	modelPath    := flag.String("model", "", "path to model_weights.json (enables MLP play)")
+	bidModelPath := flag.String("bid-model", "", "path to bid_model_weights.json (enables MLP bidding)")
 	flag.Parse()
 
-	defaultLevel = *level
-	if defaultLevel < 1 { defaultLevel = 1 }
-	if defaultLevel > 5 { defaultLevel = 5 }
-
-	var mlpStrat game.Strategy
 	if *modelPath != "" {
 		model, err := ml.LoadMLP(*modelPath)
 		if err != nil {
 			log.Fatalf("load MLP: %v", err)
 		}
+		cardModel = model
 		ms := mlstrategy.NewMLPStrategy(model, strategy.Balanced)
 		if *bidModelPath != "" {
-			bidModel, err := ml.LoadBidMLP(*bidModelPath)
+			bm, err := ml.LoadBidMLP(*bidModelPath)
 			if err != nil {
 				log.Fatalf("load bid MLP: %v", err)
 			}
-			ms.WithBidModel(bidModel)
+			bidModel = bm
+			ms.WithBidModel(bm)
 			log.Printf("bid MLP loaded from %s", *bidModelPath)
 		}
 		mlpStrat = ms
 		log.Printf("MLP strategy loaded from %s", *modelPath)
 	} else {
-		log.Printf("no --model provided; levels 4-5 will play as Balanced")
+		log.Printf("no --model provided; play_style and bid_style will fall back to Balanced")
 	}
-
-	// Build all 5 difficulty levels + special personalities.
-	for i := 1; i <= 5; i++ {
-		strategies[i-1] = strategy.NewDifficulty(i, mlpStrat, rand.New(rand.NewSource(int64(i*1000))))
-	}
-	peterStrat = strategy.NewPeter(mlpStrat, rand.New(rand.NewSource(9999)))
-	level45Strat = strategy.NewLevel45(mlpStrat, rand.New(rand.NewSource(4545)))
-	level46Strat = strategy.NewLevel46(mlpStrat, rand.New(rand.NewSource(4646)))
-	personalityStrats = map[string]game.Strategy{
-		"scientist":  strategy.NewPersonality("scientist", mlpStrat, rand.New(rand.NewSource(5001))),
-		"aggressive": strategy.NewPersonality("aggressive", mlpStrat, rand.New(rand.NewSource(5002))),
-		"cautious":   strategy.NewPersonality("cautious", mlpStrat, rand.New(rand.NewSource(5003))),
-		"risky":      strategy.NewPersonality("risky", mlpStrat, rand.New(rand.NewSource(5004))),
-	}
-	log.Printf("difficulty levels 1-5 + 4.5 ready (default: %d), personalities: peter, scientist, aggressive, cautious, risky", defaultLevel)
 
 	http.HandleFunc("/health", handleHealth)
 	http.HandleFunc("/bid", handleBid)
 	http.HandleFunc("/trump", handleTrump)
 	http.HandleFunc("/play", handlePlay)
 	http.HandleFunc("/advice", handleAdvice)
+	http.HandleFunc("/evaluate/play", handleEvaluatePlay)
+	http.HandleFunc("/evaluate/bid", handleEvaluateBid)
+	http.HandleFunc("/game/new", handleGameNew)
+	http.HandleFunc("/game/state", handleGameState)
+	http.HandleFunc("/game/bid", handleGameBid)
+	http.HandleFunc("/game/trump", handleGameTrump)
+	http.HandleFunc("/game/discard", handleGameDiscard)
+	http.HandleFunc("/game/play", handleGamePlay)
+	http.HandleFunc("/game/next-hand", handleGameNextHand)
 
 	log.Printf("bot server listening on %s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, nil))
@@ -124,18 +93,31 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // --- Bid ---
 
+type BotConfigJSON struct {
+	PlayStyle   float64                   `json:"play_style"`
+	BidStyle    float64                   `json:"bid_style"`
+	Slop        float64                   `json:"slop"`
+	TrumpMemory strategy.TrumpMemoryLevel `json:"trump_memory"`
+	AceMemory   strategy.AceMemoryLevel   `json:"ace_memory"`
+}
+
 type BidRequest struct {
-	Seat        int          `json:"seat"`
-	Hand        []string     `json:"hand"`
-	State       BidStateJSON `json:"bid_state"`
-	Level       int          `json:"level,omitempty"`
-	Personality string       `json:"personality,omitempty"`
+	Seat  int          `json:"seat"`
+	Hand  []string     `json:"hand"`
+	State BidStateJSON `json:"bid_state"`
+	BotConfigJSON
 }
 
 type BidStateJSON struct {
-	CurrentHigh int    `json:"current_high"`
-	DealerSeat  int    `json:"dealer_seat"`
-	Scores      [2]int `json:"scores"`
+	CurrentHigh     int    `json:"current_high"`
+	DealerSeat      int    `json:"dealer_seat"`
+	HighSeat        int    `json:"high_seat"`        // -1 if no bids yet
+	SeatsLeft       int    `json:"seats_left"`
+	PassesSoFar     int    `json:"passes_so_far"`
+	PartnerHasBid   bool   `json:"partner_has_bid"`
+	PartnerBidLevel int    `json:"partner_bid_level"`
+	Scores          [2]int `json:"scores"`
+	SeatBidLevels   [6]int `json:"seat_bid_levels"`  // bid placed by each seat (0 = pass/not yet bid)
 }
 
 type BidResponse struct {
@@ -149,25 +131,20 @@ func handleBid(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hand := parseCards(req.Hand)
-	state := game.BidState{
-		Hand:        hand,
-		CurrentHigh: req.State.CurrentHigh,
-		DealerSeat:  req.State.DealerSeat,
-		Scores:      req.State.Scores,
-	}
-	bid := stratForRequest(req.Level, req.Personality).Bid(req.Seat, state)
-	log.Printf("BID seat=%d level=%d hand=%v currentHigh=%d dealer=%d → %d",
-		req.Seat, req.Level, req.Hand, req.State.CurrentHigh, req.State.DealerSeat, bid)
+	state := bidStateFromJSON(req.Seat, hand, req.State)
+	bot := botForConfig(req.BotConfigJSON)
+	bid := bot.Bid(req.Seat, &state)
+	log.Printf("BID seat=%d play=%.2f bid=%.2f slop=%.2f hand=%v currentHigh=%d → %d",
+		req.Seat, req.PlayStyle, req.BidStyle, req.Slop, req.Hand, req.State.CurrentHigh, bid)
 	writeJSON(w, BidResponse{Bid: bid})
 }
 
 // --- Trump ---
 
 type TrumpRequest struct {
-	Seat        int      `json:"seat"`
-	Hand        []string `json:"hand"`
-	Level       int      `json:"level,omitempty"`
-	Personality string   `json:"personality,omitempty"`
+	Seat int      `json:"seat"`
+	Hand []string `json:"hand"`
+	BotConfigJSON
 }
 
 type TrumpResponse struct {
@@ -181,33 +158,31 @@ func handleTrump(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hand := parseCards(req.Hand)
-	suit := stratForRequest(req.Level, req.Personality).ChooseTrump(req.Seat, hand)
+	bot := botForConfig(req.BotConfigJSON)
+	suit := bot.ChooseTrump(req.Seat, hand)
 	writeJSON(w, TrumpResponse{Suit: suitCode(suit)})
 }
 
 // --- Play ---
 
 type PlayRequest struct {
-	Seat        int            `json:"seat"`
-	ValidPlays  []string       `json:"valid_plays"`
-	State       TrickStateJSON `json:"state"`
-	Level       int            `json:"level,omitempty"`
-	Personality string         `json:"personality,omitempty"`
+	Seat       int            `json:"seat"`
+	ValidPlays []string       `json:"valid_plays"`
+	State      TrickStateJSON `json:"state"`
+	BotConfigJSON
 }
 
 type TrickStateJSON struct {
-	Trump       string          `json:"trump"`
-	BidderSeat  int             `json:"bidder_seat"`
-	BidAmount   int             `json:"bid_amount"`
-	TrickNumber int             `json:"trick_number"`
-	TricksTaken [6]int          `json:"tricks_taken"`
-	Scores      [2]int          `json:"scores"`
-	Hand        []string        `json:"hand"`
+	Trump       string           `json:"trump"`
+	BidderSeat  int              `json:"bidder_seat"`
+	BidAmount   int              `json:"bid_amount"`
+	TrickNumber int              `json:"trick_number"`
+	TricksTaken [6]int           `json:"tricks_taken"`
+	Scores      [2]int           `json:"scores"`
+	Hand        []string         `json:"hand"`
 	Trick       []PlayedCardJSON `json:"trick"`
-	Leader      int             `json:"leader"`
-	// History: each element is the flat list of card codes played in one completed trick.
-	// PHP reconstructs this by exclusion: all deck cards minus current hands minus current trick.
-	History     [][]string      `json:"history"`
+	Leader      int              `json:"leader"`
+	History     [][]string       `json:"history"`
 }
 
 type PlayedCardJSON struct {
@@ -232,17 +207,12 @@ func handlePlay(w http.ResponseWriter, r *http.Request) {
 		trick.Add(parseCard(pc.Card), pc.Seat)
 	}
 
-	// Reconstruct hand history from previously played cards.
 	var history game.HandHistory
 	for _, trickCodes := range req.State.History {
 		history.Record(parseCards(trickCodes))
 	}
 
 	hand := parseCards(req.State.Hand)
-
-	// Use the caller-supplied valid plays. The external system tracks copy
-	// indices correctly; recomputing here would misidentify already-played
-	// duplicates as still-available (since parseCard always assigns CopyIndex=0).
 	validPlays := parseCards(req.ValidPlays)
 
 	state := game.TrickState{
@@ -258,25 +228,26 @@ func handlePlay(w http.ResponseWriter, r *http.Request) {
 		History:     &history,
 	}
 
-	chosen := stratForRequest(req.Level, req.Personality).Play(req.Seat, validPlays, state)
-	log.Printf("PLAY seat=%d level=%d trump=%s trick=%v valid=%v hand=%v → %s",
-		req.Seat, req.Level, req.State.Trump, req.ValidPlays, req.State.Trick, req.State.Hand, cardCode(chosen))
+	bot := botForConfig(req.BotConfigJSON)
+	chosen := bot.Play(req.Seat, validPlays, &state)
+	log.Printf("PLAY seat=%d play=%.2f bid=%.2f slop=%.2f trump=%s → %s",
+		req.Seat, req.PlayStyle, req.BidStyle, req.Slop, req.State.Trump, cardCode(chosen))
 	writeJSON(w, PlayResponse{Card: cardCode(chosen)})
 }
 
 // --- Advice (Ask Grandpa) ---
 
 type AdviceRequest struct {
-	Type       string         `json:"type"` // "bid" or "play"
-	Seat       int            `json:"seat"`
-	Hand       []string       `json:"hand"`
-	BidState   *BidStateJSON  `json:"bid_state,omitempty"`
-	ValidPlays []string       `json:"valid_plays,omitempty"`
+	Type       string          `json:"type"` // "bid" or "play"
+	Seat       int             `json:"seat"`
+	Hand       []string        `json:"hand"`
+	BidState   *BidStateJSON   `json:"bid_state,omitempty"`
+	ValidPlays []string        `json:"valid_plays,omitempty"`
 	State      *TrickStateJSON `json:"state,omitempty"`
 }
 
 type AdviceResponse struct {
-	Suggestion string `json:"suggestion"` // bid number or card code
+	Suggestion  string `json:"suggestion"`
 	Explanation string `json:"explanation"`
 }
 
@@ -287,7 +258,8 @@ func handleAdvice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	expert := stratForRequest(5, "") // always level 5 for grandpa
+	// Advice always uses the strongest config: full MLP, no slop.
+	expert := botForConfig(BotConfigJSON{PlayStyle: 1.0, BidStyle: 1.0, TrumpMemory: strategy.TrumpMemoryFull, AceMemory: strategy.AceMemoryAces})
 
 	switch req.Type {
 	case "bid":
@@ -302,7 +274,7 @@ func handleAdvice(w http.ResponseWriter, r *http.Request) {
 			DealerSeat:  req.BidState.DealerSeat,
 			Scores:      req.BidState.Scores,
 		}
-		bid := expert.Bid(req.Seat, state)
+		bid := expert.Bid(req.Seat, &state)
 		suggestion := fmt.Sprintf("%d", bid)
 		explanation := "Pass"
 		if bid == game.PepperBid {
@@ -344,11 +316,11 @@ func handleAdvice(w http.ResponseWriter, r *http.Request) {
 			Hand:        hand,
 			History:     &history,
 		}
-		chosen := expert.Play(req.Seat, validPlays, state)
+		chosen := expert.Play(req.Seat, validPlays, &state)
 		code := cardCode(chosen)
 		log.Printf("ADVICE play seat=%d → %s", req.Seat, code)
 		writeJSON(w, AdviceResponse{
-			Suggestion: code,
+			Suggestion:  code,
 			Explanation: fmt.Sprintf("Grandpa says play the %s", code),
 		})
 
@@ -364,7 +336,6 @@ func writeJSON(w http.ResponseWriter, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-// cardCode returns a 2-char code like "JH", "AC", "9S".
 func cardCode(c card.Card) string {
 	ranks := map[card.Rank]string{
 		card.Nine: "9", card.Ten: "T", card.Jack: "J",

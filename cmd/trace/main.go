@@ -13,27 +13,20 @@ func main() {
 	n := flag.Int("n", 1, "number of full games to trace")
 	hands := flag.Int("hands", 0, "stop after this many hands total (0 = full game)")
 	seed := flag.Int64("seed", 1, "random seed")
-	strat := flag.String("strat", "balanced", "strategy for all players: conservative, balanced, aggressive")
+	strat := flag.String("strat", "balanced", "strategy for all players (currently only: balanced)")
 	tricks := flag.Bool("tricks", false, "show every card played in each trick")
 	flag.Parse()
 
 	rng := rand.New(rand.NewSource(*seed))
 	log := game.NewPrintLogger(*tricks)
 
-	var cfg strategy.Config
-	switch *strat {
-	case "conservative":
-		cfg = strategy.Conservative
-	case "aggressive":
-		cfg = strategy.Aggressive
-	default:
-		cfg = strategy.Balanced
-	}
+	cfg := strategy.Balanced
+	_ = strat
 
 	for g := 0; g < *n; g++ {
-		fmt.Printf("\n%s\nGAME %d  (strategy: %s)\n%s\n",
+		fmt.Printf("\n%s\nGAME %d  (strategy: balanced)\n%s\n",
 			"╔══════════════════════════════════════════════════════════╗",
-			g+1, cfg.Name,
+			g+1,
 			"╚══════════════════════════════════════════════════════════╝")
 
 		gs := game.NewGame(rng.Intn(6))

@@ -9,11 +9,11 @@ import (
 // Strategy is the interface every bot must implement.
 type Strategy interface {
 	// Bid returns the player's bid: 0=pass, 8=pepper, else a number in 4–7.
-	Bid(seat int, state BidState) int
+	Bid(seat int, state *BidState) int
 
 	// Play returns the card the player wants to play.
 	// The engine guarantees only valid plays are accepted.
-	Play(seat int, hand []card.Card, state TrickState) card.Card
+	Play(seat int, hand []card.Card, state *TrickState) card.Card
 
 	// GivePepper returns the best trump card to give the pepper caller.
 	GivePepper(seat int, hand []card.Card, trump card.Suit) card.Card
@@ -54,7 +54,7 @@ func playHandFrom(gs *GameState, strategies [6]Strategy, rng *rand.Rand, log Log
 			gs.Dealer,
 			gs.Scores,
 			func(seat int, state BidState) int {
-				bid := strategies[seat].Bid(seat, state)
+				bid := strategies[seat].Bid(seat, &state)
 				log.OnBid(seat, bid, bid == PepperBid, false)
 				return bid
 			},
@@ -134,7 +134,7 @@ func playHandFrom(gs *GameState, strategies [6]Strategy, rng *rand.Rand, log Log
 		for step := 0; step < len(activeSeatSet); step++ {
 			seat := activeSeatSet[(indexInActive(activeSeatSet, leader)+step)%len(activeSeatSet)]
 			valid := ValidPlays(hands[seat], trick, trump)
-			chosen := strategies[seat].Play(seat, valid, TrickState{
+			chosen := strategies[seat].Play(seat, valid, &TrickState{
 				Trick:       trick,
 				Trump:       trump,
 				Seat:        seat,
@@ -155,13 +155,13 @@ func playHandFrom(gs *GameState, strategies [6]Strategy, rng *rand.Rand, log Log
 		if card.EffectiveSuit(trick.Cards[0].Card, trump) == trump {
 			trumpStats.TrumpLedsCount++
 		}
-		for _, pc := range trick.Cards {
+		for _, pc := range trick.Cards[:trick.NCards] {
 			if card.TrumpRank(pc.Card, trump) >= 0 {
 				cumulativeTrumpPlayed++
 			}
 		}
 		trumpStats.TrumpPlayedByTrick[t] = cumulativeTrumpPlayed
-		history.RecordTrick(trick.Cards)
+		history.RecordTrick(trick.Cards[:trick.NCards])
 
 		winner := trick.Winner()
 		tricksTaken[winner]++

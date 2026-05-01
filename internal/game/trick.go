@@ -12,8 +12,10 @@ type PlayedCard struct {
 // Trick holds the cards played in a single trick.
 // winnerIdx, winnerTR, winnerNR, and ledSuit are maintained incrementally in Add
 // so that Winner() and WinnerCard() are O(1) field reads.
+// Cards is a fixed-size array; NCards tracks how many have been played.
 type Trick struct {
-	Cards     []PlayedCard
+	Cards     [6]PlayedCard
+	NCards    int
 	Trump     card.Suit
 	Leader    int
 	winnerIdx int       // index into Cards of current winner
@@ -27,7 +29,6 @@ func NewTrick(leader int, trump card.Suit) *Trick {
 	return &Trick{
 		Leader: leader,
 		Trump:  trump,
-		Cards:  make([]PlayedCard, 0, 6),
 	}
 }
 
@@ -35,15 +36,16 @@ func NewTrick(leader int, trump card.Suit) *Trick {
 func (t *Trick) Reset(leader int, trump card.Suit) {
 	t.Leader = leader
 	t.Trump = trump
-	t.Cards = t.Cards[:0]
+	t.NCards = 0
 	t.winnerIdx = 0
 	t.winnerTR = -1
 }
 
 // Add records a card played by a seat and updates the winner incrementally.
 func (t *Trick) Add(c card.Card, seat int) {
-	idx := len(t.Cards)
-	t.Cards = append(t.Cards, PlayedCard{Card: c, Seat: seat, PlayOrder: idx})
+	idx := t.NCards
+	t.Cards[idx] = PlayedCard{Card: c, Seat: seat, PlayOrder: idx}
+	t.NCards++
 
 	newTR := card.TrumpRank(c, t.Trump)
 
@@ -85,7 +87,7 @@ func (t *Trick) Add(c card.Card, seat int) {
 
 // LedSuit returns the effective suit of the first card played.
 func (t *Trick) LedSuit() card.Suit {
-	if len(t.Cards) == 0 {
+	if t.NCards == 0 {
 		panic("no cards played yet")
 	}
 	return t.ledSuit
@@ -93,7 +95,7 @@ func (t *Trick) LedSuit() card.Suit {
 
 // Winner returns the seat that currently wins this trick (O(1)).
 func (t *Trick) Winner() int {
-	if len(t.Cards) == 0 {
+	if t.NCards == 0 {
 		panic("no cards played")
 	}
 	return t.Cards[t.winnerIdx].Seat
@@ -101,7 +103,7 @@ func (t *Trick) Winner() int {
 
 // WinnerCard returns the card currently winning this trick (O(1)).
 func (t *Trick) WinnerCard() card.Card {
-	if len(t.Cards) == 0 {
+	if t.NCards == 0 {
 		panic("no cards played")
 	}
 	return t.Cards[t.winnerIdx].Card
@@ -124,7 +126,7 @@ type TrickState struct {
 // ValidPlays returns the subset of hand that are legal to play.
 // A player must follow the led suit (using effective suit) if possible.
 func ValidPlays(hand []card.Card, trick *Trick, trump card.Suit) []card.Card {
-	if len(trick.Cards) == 0 {
+	if trick.NCards == 0 {
 		return hand
 	}
 	ledSuit := trick.LedSuit()
@@ -144,7 +146,7 @@ func ValidPlays(hand []card.Card, trick *Trick, trump card.Suit) []card.Card {
 // When leading or void in suit, returns hand directly without touching *dst.
 // The pointer lets the caller's buffer grow once and stay allocated — zero allocs after warmup.
 func ValidPlaysInto(dst *[]card.Card, hand []card.Card, trick *Trick, trump card.Suit) []card.Card {
-	if len(trick.Cards) == 0 {
+	if trick.NCards == 0 {
 		return hand
 	}
 	ledSuit := trick.LedSuit()

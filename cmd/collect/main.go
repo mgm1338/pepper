@@ -5,7 +5,6 @@ import (
 	"encoding/csv"
 	"flag"
 	"fmt"
-	"log"
 	"math/rand"
 	"os"
 	"strconv"
@@ -37,18 +36,20 @@ func main() {
 		var err error
 		baseModel, err = ml.LoadMLP(*modelPath)
 		if err != nil {
-			log.Fatalf("load MLP: %v", err)
+			fmt.Printf("  Model:    %s (incompatible, falling back to Balanced: %v)\n", *modelPath, err)
+		} else {
+			fmt.Printf("  Model:    %s (MLP self-play)\n", *modelPath)
 		}
-		fmt.Printf("  Model:    %s (MLP self-play)\n", *modelPath)
 	}
 	var baseBidModel *ml.BidMLP
 	if *bidModelPath != "" {
 		var err error
 		baseBidModel, err = ml.LoadBidMLP(*bidModelPath)
 		if err != nil {
-			log.Fatalf("load bid MLP: %v", err)
+			fmt.Printf("  Bid model: %s (incompatible, falling back to Balanced: %v)\n", *bidModelPath, err)
+		} else {
+			fmt.Printf("  Bid model: %s\n", *bidModelPath)
 		}
-		fmt.Printf("  Bid model: %s\n", *bidModelPath)
 	}
 
 	fmt.Printf("Collecting training data:\n")
@@ -124,33 +125,36 @@ func main() {
 			rng := rand.New(rand.NewSource(*seed + int64(wid*1_000_000)))
 			gs := game.NewGame(rng.Intn(6))
 
-			// Each worker gets its own MLP clone (independent scratch buffers).
-			// Bidding/trump/pepper always use Balanced fallback.
+			// One card+bid MLP clone per worker — all 6 seats share it since
+			// CollectHand runs sequentially within a goroutine.
 			var strats [6]game.Strategy
 			var rolloutStrats [6]game.Strategy
-			for s := 0; s < 6; s++ {
-				if baseModel != nil {
-					play := mlstrategy.NewMLPStrategy(baseModel.Clone(), strategy.Balanced)
-					if baseBidModel != nil {
-						play = play.WithBidModel(baseBidModel.Clone())
-					}
-					var playStrat game.Strategy = play
-					if *epsilon > 0 {
-						playStrat = &epsilonStrategy{inner: play, epsilon: *epsilon, rng: rng}
-					}
+			if baseModel != nil {
+				sharedPlay := mlstrategy.NewMLPStrategy(baseModel.Clone(), strategy.Balanced)
+				if baseBidModel != nil {
+					sharedPlay = sharedPlay.WithBidModel(baseBidModel.Clone())
+				}
+				var playStrat game.Strategy = sharedPlay
+				if *epsilon > 0 {
+					playStrat = &epsilonStrategy{inner: sharedPlay, epsilon: *epsilon, rng: rng}
+				}
+				sharedRollout := mlstrategy.NewMLPStrategy(baseModel.Clone(), strategy.Balanced)
+				if baseBidModel != nil {
+					sharedRollout = sharedRollout.WithBidModel(baseBidModel.Clone())
+				}
+				var rolloutStrat game.Strategy = sharedRollout
+				if *rolloutEpsilon > 0 {
+					rolloutStrat = &epsilonStrategy{inner: sharedRollout, epsilon: *rolloutEpsilon, rng: rng}
+				}
+				for s := 0; s < 6; s++ {
 					strats[s] = playStrat
-					rollout := mlstrategy.NewMLPStrategy(baseModel.Clone(), strategy.Balanced)
-					if baseBidModel != nil {
-						rollout = rollout.WithBidModel(baseBidModel.Clone())
-					}
-					var rolloutStrat game.Strategy = rollout
-					if *rolloutEpsilon > 0 {
-						rolloutStrat = &epsilonStrategy{inner: rollout, epsilon: *rolloutEpsilon, rng: rng}
-					}
 					rolloutStrats[s] = rolloutStrat
-				} else {
-					strats[s] = strategy.NewStandard(strategy.Balanced)
-					rolloutStrats[s] = strategy.NewStandard(strategy.Balanced)
+				}
+			} else {
+				shared := strategy.NewStandard(strategy.Balanced)
+				for s := 0; s < 6; s++ {
+					strats[s] = shared
+					rolloutStrats[s] = shared
 				}
 			}
 
@@ -161,12 +165,11 @@ func main() {
 					rowCh <- rows
 				}
 
-				// Advance game state.
-				// We don't track actual scores here since CollectHand uses neutral
-				// scores for feature extraction. Reset game periodically.
 				gs.NextDealer()
 				if gs.Round%50 == 0 {
 					gs = game.NewGame(rng.Intn(6))
+					gs.Scores[0] = rng.Intn(64)
+					gs.Scores[1] = rng.Intn(64)
 				}
 
 				// Progress report from worker 0.
@@ -200,11 +203,11 @@ type epsilonStrategy struct {
 	rng     *rand.Rand
 }
 
-func (s *epsilonStrategy) Bid(seat int, state game.BidState) int { return s.inner.Bid(seat, state) }
+func (s *epsilonStrategy) Bid(seat int, state *game.BidState) int { return s.inner.Bid(seat, state) }
 func (s *epsilonStrategy) ChooseTrump(seat int, hand []card.Card) card.Suit { return s.inner.ChooseTrump(seat, hand) }
 func (s *epsilonStrategy) GivePepper(seat int, hand []card.Card, trump card.Suit) card.Card { return s.inner.GivePepper(seat, hand, trump) }
 func (s *epsilonStrategy) PepperDiscard(seat int, hand []card.Card, trump card.Suit, received [2]card.Card) [2]card.Card { return s.inner.PepperDiscard(seat, hand, trump, received) }
-func (s *epsilonStrategy) Play(seat int, validPlays []card.Card, state game.TrickState) card.Card {
+func (s *epsilonStrategy) Play(seat int, validPlays []card.Card, state *game.TrickState) card.Card {
 	if len(validPlays) > 1 && s.rng.Float64() < s.epsilon {
 		return validPlays[s.rng.Intn(len(validPlays))]
 	}

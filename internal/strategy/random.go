@@ -16,7 +16,7 @@ func NewRandom(rng *rand.Rand) *Random {
 	return &Random{rng: rng}
 }
 
-func (r *Random) Bid(seat int, state game.BidState) int {
+func (r *Random) Bid(seat int, state *game.BidState) int {
 	minBid := game.MinBid
 	if state.CurrentHigh >= game.MinBid {
 		minBid = state.CurrentHigh + 1
@@ -30,7 +30,7 @@ func (r *Random) Bid(seat int, state game.BidState) int {
 	return minBid + r.rng.Intn(8-minBid+1)
 }
 
-func (r *Random) Play(seat int, validPlays []card.Card, state game.TrickState) card.Card {
+func (r *Random) Play(seat int, validPlays []card.Card, state *game.TrickState) card.Card {
 	return validPlays[r.rng.Intn(len(validPlays))]
 }
 

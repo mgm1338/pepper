@@ -9,13 +9,13 @@ import (
 // choices at a decision point, followed by CardFeatureLen card-specific features appended
 // once per candidate card. One training row = one (decision point, candidate card) pair.
 const (
-	ContextFeatureLen = 37
-	CardFeatureLen    = 6
+	ContextFeatureLen = 40
+	CardFeatureLen    = 7
 	TotalFeatureLen   = ContextFeatureLen + CardFeatureLen
 )
 
 // FeatureNames provides human-readable column names for the full feature vector.
-// Indices 0–36 are context, 37–42 are per-card.
+// Indices 0–39 are context, 40–46 are per-card.
 var FeatureNames = [TotalFeatureLen]string{
 	// Position / role (0–3)
 	"seat_rel_bidder",   // (seat - bidderSeat + 6) % 6, normalized 0–1
@@ -70,13 +70,19 @@ var FeatureNames = [TotalFeatureLen]string{
 	"opp_trump_est",     // (trump_remaining - my_trump) / 14
 	"is_last_to_play",   // 1 if I'm the last to act in this trick
 
-	// Per-card features (37–42)
-	"card_is_trump",    // 1 if candidate card is trump
-	"card_rank_norm",   // trump rank / 13 if trump, else off-suit rank / 6
-	"card_is_top",      // 1 if candidate is the current top unplayed trump
-	"can_beat_winner",  // 1 if this card beats the current trick leader
-	"is_overtrump",     // 1 if card is trump and current winner is also trump
-	"card_suit_count",  // cards of this suit in my hand / 8
+	// Trick winner knowledge (37–39)
+	"winner_is_unbeatable",      // 1 if current winner card is highest remaining of its kind
+	"i_can_beat_winner",         // 1 if I hold any card that beats the current winner
+	"partner_winning_unbeatable", // 1 if partner is winning with an unbeatable card
+
+	// Per-card features (40–46)
+	"card_is_trump",         // 1 if candidate card is trump
+	"card_rank_norm",        // trump rank / 13 if trump, else off-suit rank / 6
+	"card_is_top",           // 1 if candidate is the current top unplayed trump
+	"can_beat_winner",       // 1 if this card beats the current trick leader
+	"is_overtrump",          // 1 if card is trump and current winner is also trump
+	"card_suit_count",       // cards of this suit in my hand / 8
+	"card_is_top_in_suit",   // 1 if no higher-ranked card of this non-trump suit remains unplayed
 }
 
 // ExtractContext builds the 37 shared context features for a play decision.
@@ -89,7 +95,7 @@ func ExtractContext(seat int, hand []card.Card, state game.TrickState, activePla
 	trump := state.Trump
 	trick := state.Trick
 	bidderSeat := state.BidderSeat
-	cardsInTrick := len(trick.Cards)
+	cardsInTrick := trick.NCards
 
 	maxPos := float32(activePlayers - 1)
 	if maxPos < 1 {
@@ -177,7 +183,7 @@ func ExtractContext(seat int, hand []card.Card, state game.TrickState, activePla
 		}
 		i++ // partner_winning
 
-		for _, pc := range trick.Cards {
+		for _, pc := range trick.Cards[:trick.NCards] {
 			if pc.Seat == bidderSeat {
 				f[i] = 1.0
 				break
@@ -185,7 +191,7 @@ func ExtractContext(seat int, hand []card.Card, state game.TrickState, activePla
 		}
 		i++ // bidder_has_played
 
-		for _, pc := range trick.Cards {
+		for _, pc := range trick.Cards[:trick.NCards] {
 			if pc.Seat == winnerSeat {
 				rank := card.TrumpRank(pc.Card, trump)
 				if rank >= 0 {
@@ -328,6 +334,84 @@ func ExtractContext(seat int, hand []card.Card, state game.TrickState, activePla
 	}
 	i++ // is_last_to_play
 
+	// --- Trick winner knowledge (37–39) ---
+	if cardsInTrick > 0 {
+		winnerCard := trick.WinnerCard()
+		winnerTR := card.TrumpRank(winnerCard, trump)
+		partnerWinning := false
+		for _, p := range game.Partners(seat) {
+			if trick.Winner() == p {
+				partnerWinning = true
+				break
+			}
+		}
+
+		// winner_is_unbeatable: no unplayed card (outside the trick) beats the current winner.
+		unbeatable := false
+		if winnerTR >= 0 {
+			unbeatable = h.IsTopTrump(winnerCard, trump)
+		} else {
+			// Non-trump winner: check if any higher non-trump card of the led suit is still out.
+			ledSuit := trick.LedSuit()
+			winnerNR := card.NonTrumpRank(winnerCard)
+			unbeatable = true
+		outerWin:
+			for _, r := range []card.Rank{card.Nine, card.Ten, card.Jack, card.Queen, card.King, card.Ace} {
+				cand := card.Card{Suit: ledSuit, Rank: r}
+				if card.NonTrumpRank(cand) > winnerNR && card.TrumpRank(cand, trump) < 0 {
+					for ci := 0; ci < 2; ci++ {
+						if !h.IsSeen(card.Card{Suit: ledSuit, Rank: r, CopyIndex: ci}) {
+							unbeatable = false
+							break outerWin
+						}
+					}
+				}
+			}
+			// Also check if any trump remains — trump always beats a non-trump winner.
+			if h.TrumpRemaining(trump) > 0 {
+				unbeatable = false
+			}
+		}
+		if unbeatable {
+			f[i] = 1.0
+		}
+		i++ // winner_is_unbeatable
+
+		// i_can_beat_winner: I hold at least one card that beats the current winner.
+		iCanBeat := false
+		for _, hc := range hand {
+			hcTR := card.TrumpRank(hc, trump)
+			canBeat := false
+			if winnerTR >= 0 {
+				canBeat = hcTR > winnerTR
+			} else {
+				if hcTR >= 0 {
+					canBeat = true
+				} else {
+					ledSuit := trick.LedSuit()
+					if card.EffectiveSuit(hc, trump) == ledSuit {
+						canBeat = card.NonTrumpRank(hc) > card.NonTrumpRank(winnerCard)
+					}
+				}
+			}
+			if canBeat {
+				iCanBeat = true
+				break
+			}
+		}
+		if iCanBeat {
+			f[i] = 1.0
+		}
+		i++ // i_can_beat_winner
+
+		if partnerWinning && unbeatable {
+			f[i] = 1.0
+		}
+		i++ // partner_winning_unbeatable
+	} else {
+		i += 3 // winner_is_unbeatable, i_can_beat_winner, partner_winning_unbeatable all 0 when leading
+	}
+
 	_ = i // i == ContextFeatureLen here
 	return f
 }
@@ -360,7 +444,7 @@ func AppendCard(ctx [ContextFeatureLen]float32, c card.Card, trump card.Suit, ha
 	i++ // card_is_top
 
 	// can_beat_winner and is_overtrump
-	if trick == nil || len(trick.Cards) == 0 {
+	if trick == nil || trick.NCards == 0 {
 		// Leading: always "wins" by default (sets the bar).
 		f[i] = 1.0
 		i++ // can_beat_winner
@@ -368,7 +452,7 @@ func AppendCard(ctx [ContextFeatureLen]float32, c card.Card, trump card.Suit, ha
 	} else {
 		winnerSeat := trick.Winner()
 		var winnerCard card.Card
-		for _, pc := range trick.Cards {
+		for _, pc := range trick.Cards[:trick.NCards] {
 			if pc.Seat == winnerSeat {
 				winnerCard = pc.Card
 				break
@@ -416,6 +500,28 @@ func AppendCard(ctx [ContextFeatureLen]float32, c card.Card, trump card.Suit, ha
 	}
 	f[i] = float32(suitCount) / 8.0
 	i++ // card_suit_count
+
+	// card_is_top_in_suit: for non-trump, 1 if every higher-ranked card of this suit has been played.
+	if !isTrump && history != nil {
+		myRank := card.NonTrumpRank(c)
+		isTop := true
+	outer:
+		for _, r := range []card.Rank{card.Nine, card.Ten, card.Jack, card.Queen, card.King, card.Ace} {
+			higher := card.Card{Suit: c.Suit, Rank: r}
+			if card.NonTrumpRank(higher) > myRank && card.TrumpRank(higher, trump) < 0 {
+				for ci := 0; ci < 2; ci++ {
+					if !history.IsSeen(card.Card{Suit: c.Suit, Rank: r, CopyIndex: ci}) {
+						isTop = false
+						break outer
+					}
+				}
+			}
+		}
+		if isTop {
+			f[i] = 1.0
+		}
+	}
+	i++ // card_is_top_in_suit
 
 	_ = i
 	return f

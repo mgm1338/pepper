@@ -64,11 +64,11 @@ type alwaysPepperStrategy struct {
 	inner *strategy.StandardStrategy
 }
 
-func (a *alwaysPepperStrategy) Bid(seat int, state game.BidState) int {
+func (a *alwaysPepperStrategy) Bid(seat int, state *game.BidState) int {
 	// Always call pepper when it's our turn to act.
 	return game.PepperBid
 }
-func (a *alwaysPepperStrategy) Play(seat int, hand []card.Card, state game.TrickState) card.Card {
+func (a *alwaysPepperStrategy) Play(seat int, hand []card.Card, state *game.TrickState) card.Card {
 	return a.inner.Play(seat, hand, state)
 }
 func (a *alwaysPepperStrategy) GivePepper(seat int, hand []card.Card, trump card.Suit) card.Card {
@@ -228,7 +228,7 @@ func runOnePepperHand(rng *rand.Rand, pepperCaller game.Strategy, normal game.St
 		gs.Dealer,
 		gs.Scores,
 		func(seat int, state game.BidState) int {
-			return strategies[seat].Bid(seat, state)
+			return strategies[seat].Bid(seat, &state)
 		},
 	)
 

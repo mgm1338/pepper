@@ -5,69 +5,10 @@ import (
 	"io"
 	"math"
 	"math/rand"
-	"sync"
 
 	"github.com/max/pepper/internal/card"
 	"github.com/max/pepper/internal/game"
 )
-
-// fullDeck is a cached pinochle deck used for alloc-free hand resampling.
-var fullDeck [48]card.Card
-
-func init() {
-	deck := card.NewPinochleDeck()
-	copy(fullDeck[:], deck)
-}
-
-// bidResampleBuf holds pre-allocated scratch space for opponent hand resampling.
-// One buffer is needed per goroutine — get from bidResamplePool.
-type bidResampleBuf struct {
-	remaining  [40]card.Card
-	otherHands [5][8]card.Card
-}
-
-var bidResamplePool = sync.Pool{
-	New: func() interface{} { return &bidResampleBuf{} },
-}
-
-// resampleOtherHands fills resampledHands with fresh randomly distributed cards:
-// resampledHands[fixedSeat] = fixedHand (by reference, safe because playHand copies),
-// and all other seats get 8 cards randomly drawn from the remaining 40.
-// Allocation-free: all scratch memory comes from buf.
-func resampleOtherHands(fixedSeat int, fixedHand []card.Card, resampledHands *[6][]card.Card, buf *bidResampleBuf, rng *rand.Rand) {
-	n := 0
-outer:
-	for _, c := range fullDeck {
-		for _, h := range fixedHand {
-			if c == h {
-				continue outer
-			}
-		}
-		buf.remaining[n] = c
-		n++
-	}
-	// n == 40 always for a valid 8-card hand
-
-	// Fisher-Yates shuffle remaining 40 cards.
-	for i := 39; i > 0; i-- {
-		j := rng.Intn(i + 1)
-		buf.remaining[i], buf.remaining[j] = buf.remaining[j], buf.remaining[i]
-	}
-
-	// Distribute 8 cards to each non-fixed seat.
-	off := 0
-	hi := 0
-	for s := 0; s < 6; s++ {
-		if s == fixedSeat {
-			resampledHands[s] = fixedHand
-		} else {
-			copy(buf.otherHands[hi][:], buf.remaining[off:off+8])
-			resampledHands[s] = buf.otherHands[hi][:]
-			off += 8
-			hi++
-		}
-	}
-}
 
 // BidCollectRow is one training example...
 type BidCollectRow struct {
@@ -120,8 +61,9 @@ type bidPoint struct {
 	dealer        int
 	scores        [2]int
 	currentHigh   int
-	highSeat      int    // seat that holds current high bid (-1 if none)
-	seatsLeft     []int  // seats that still need to bid after this one (in order)
+	highSeat      int      // seat that holds current high bid (-1 if none)
+	seatsLeft     [6]int   // seats that still need to bid after this one (in order)
+	nSeatsLeft    int
 	passesSoFar   int
 	partnerHasBid [6]bool
 	seatBidLevel  [6]int
@@ -129,7 +71,7 @@ type bidPoint struct {
 
 // rollout completes the auction and plays the hand using the provided (possibly resampled) hands.
 // Returns score delta for dp.seat's team.
-func (dp bidPoint) rollout(forcedBid int, hands [6][]card.Card, rolloutStrat [6]game.Strategy, rng *rand.Rand, validBuf *[]card.Card) int {
+func (dp *bidPoint) rollout(forcedBid int, hands *[6][]card.Card, rolloutStrat *[6]game.Strategy, rng *rand.Rand, validBuf *[]card.Card) int {
 	currentHigh := dp.currentHigh
 	highSeat := dp.highSeat
 	passesSoFar := dp.passesSoFar
@@ -156,7 +98,8 @@ func (dp bidPoint) rollout(forcedBid int, hands [6][]card.Card, rolloutStrat [6]
 	}
 
 	// Continue bidding for remaining seats with full BidState context.
-	for step, nextSeat := range dp.seatsLeft {
+	for step := 0; step < dp.nSeatsLeft; step++ {
+		nextSeat := dp.seatsLeft[step]
 		isDealerTurn := nextSeat == dp.dealer
 		if isDealerTurn && highSeat == -1 {
 			return dp.playHand(hands, dp.dealer, game.StuckBid, false, rolloutStrat, rng, validBuf)
@@ -180,13 +123,13 @@ func (dp bidPoint) rollout(forcedBid int, hands [6][]card.Card, rolloutStrat [6]
 			DealerSeat:      dp.dealer,
 			CurrentHigh:     currentHigh,
 			HighSeat:        highSeat,
-			SeatsLeft:       len(dp.seatsLeft) - step - 1,
+			SeatsLeft:       dp.nSeatsLeft - step - 1,
 			Scores:          dp.scores,
 			PassesSoFar:     passesSoFar,
 			PartnerHasBid:   anyPartnerBid,
 			PartnerBidLevel: partnerBidLvl,
 		}
-		bid := rolloutStrat[nextSeat].Bid(nextSeat, bidState)
+		bid := rolloutStrat[nextSeat].Bid(nextSeat, &bidState)
 
 		if bid == game.PepperBid {
 			return dp.playHand(hands, nextSeat, game.PepperBid, true, rolloutStrat, rng, validBuf)
@@ -215,19 +158,19 @@ func (dp bidPoint) rollout(forcedBid int, hands [6][]card.Card, rolloutStrat [6]
 
 // playHand plays a complete hand given the auction result and returns score delta
 // for dp.seat's team. dealtHands are the hands for this rollout (already re-sampled).
-func (dp bidPoint) playHand(
-	dealtHands [6][]card.Card,
+func (dp *bidPoint) playHand(
+	dealtHands *[6][]card.Card,
 	callerSeat int,
 	bidAmount int,
 	isPepper bool,
-	rolloutStrat [6]game.Strategy,
+	rolloutStrat *[6]game.Strategy,
 	rng *rand.Rand,
 	validBuf *[]card.Card,
 ) int {
 	// Get a pooled buffer and copy hands into it — avoids per-rollout make() calls.
 	buf := handBufPool.Get().(*[6][]card.Card)
 	var hands [6][]card.Card
-	for i, h := range dealtHands {
+	for i, h := range *dealtHands {
 		n := len(h)
 		hands[i] = (*buf)[i][:n]
 		copy(hands[i], h)
@@ -279,12 +222,12 @@ func (dp bidPoint) playHand(
 				History:     history,
 				Hand:        hands[seat],
 			}
-			chosen := rolloutStrat[seat].Play(seat, valid, state)
+			chosen := rolloutStrat[seat].Play(seat, valid, &state)
 			trick.Add(chosen, seat)
 			hands[seat] = dropCardInPlace(hands[seat], chosen)
 		}
 
-		history.RecordTrick(trick.Cards)
+		history.RecordTrick(trick.Cards[:trick.NCards])
 		winner := trick.Winner()
 		tricksTaken[winner]++
 		leader = winner
@@ -312,7 +255,8 @@ func CollectBidHand(
 	rng *rand.Rand,
 	rollouts int,
 ) []BidCollectRow {
-	hands := card.Deal(rng)
+	dealBuf := dealBufPool.Get().(*card.DealBuf)
+	hands := card.DealInto(dealBuf, rng)
 	dealer := gs.Dealer
 	scores := gs.Scores
 
@@ -321,16 +265,12 @@ func CollectBidHand(
 	passesSoFar := 0
 	partnerHasBid := [6]bool{}
 	seatBidLevel := [6]int{}
-	rows := make([]BidCollectRow, 0, 6*6)
+	rows := bidRowsBufPool.Get().([]BidCollectRow)[:0]
 
-	// Pre-allocate slices reused across all seat iterations.
-	seatsLeft := make([]int, 0, 6)
-	var rolloutValidBuf []card.Card
-	var resampledHands [6][]card.Card
-
-	// One resample buffer per CollectBidHand call (shared across all seat/bid iterations).
-	rsBuf := bidResamplePool.Get().(*bidResampleBuf)
-	defer bidResamplePool.Put(rsBuf)
+	var seatsLeft [6]int
+	rolloutValidBufPtr := validCardBufPool.Get().(*[]card.Card)
+	rolloutValidBuf := (*rolloutValidBufPtr)[:0]
+	defer func() { *rolloutValidBufPtr = rolloutValidBuf[:0]; validCardBufPool.Put(rolloutValidBufPtr) }()
 
 	for i := 1; i <= 6; i++ {
 		seat := (dealer + i) % 6
@@ -339,9 +279,10 @@ func CollectBidHand(
 			break
 		}
 
-		seatsLeft = seatsLeft[:0]
+		nSeatsLeft := 0
 		for j := i + 1; j <= 6; j++ {
-			seatsLeft = append(seatsLeft, (dealer+j)%6)
+			seatsLeft[nSeatsLeft] = (dealer + j) % 6
+			nSeatsLeft++
 		}
 
 		// Check if any teammate has placed a non-pass bid before this seat.
@@ -372,34 +313,32 @@ func CollectBidHand(
 			currentHigh:   currentHigh,
 			highSeat:      highSeat,
 			seatsLeft:     seatsLeft,
+			nSeatsLeft:    nSeatsLeft,
 			passesSoFar:   passesSoFar,
 			partnerHasBid: partnerHasBid,
 			seatBidLevel:  seatBidLevel,
 		}
 
-		ctx := BidContext(seat, hands[seat], dealer, currentHigh, highSeat, len(seatsLeft), scores, passesSoFar, anyPartnerBid, partnerBidLevel)
+		ctx := BidContext(seat, hands[seat], dealer, currentHigh, highSeat, nSeatsLeft, scores, passesSoFar, anyPartnerBid, partnerBidLevel, seatBidLevel)
 
-		// Evaluate each bid level. Each rollout resamples opponent hands so the
-		// label is E[score | my hand, bid] rather than an exact-information oracle value.
 		validBids := ValidBidLevels(currentHigh)
 		for _, bidLevel := range validBids {
-			var totalDelta float64
+			var total float64
 			for r := 0; r < rollouts; r++ {
-				resampleOtherHands(seat, hands[seat], &resampledHands, rsBuf, rng)
-				delta := dp.rollout(bidLevel, resampledHands, rolloutStrat, rng, &rolloutValidBuf)
-				totalDelta += float64(delta)
+				total += float64(dp.rollout(bidLevel, &hands, &rolloutStrat, rng, &rolloutValidBuf))
 			}
+			avgDelta := total / float64(rollouts)
 			rows = append(rows, BidCollectRow{
 				HandID:     handID,
 				Seat:       seat,
 				BidLevel:   bidLevel,
-				Features:   AppendBidAction(ctx, bidLevel),
-				ScoreDelta: float32(totalDelta / float64(rollouts)),
+				Features:   AppendBidAction(ctx, bidLevel, currentHigh),
+				ScoreDelta: float32(avgDelta),
 			})
 		}
 
 		// Advance bidding state using the base strategy's actual decision.
-		bid := strategies[seat].Bid(seat, bidState)
+		bid := strategies[seat].Bid(seat, &bidState)
 		if bid == game.PepperBid {
 			break
 		}
@@ -419,5 +358,6 @@ func CollectBidHand(
 		}
 	}
 
+	dealBufPool.Put(dealBuf)
 	return rows
 }

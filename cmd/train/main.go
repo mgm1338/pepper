@@ -21,7 +21,8 @@ func main() {
 	dataPath   := flag.String("data", "collect.csv", "Input file from cmd/collect")
 	format     := flag.String("format", "csv", "Input format: csv or bin")
 	outPath    := flag.String("out", "model_weights.json", "Output weights JSON")
-	warmStart  := flag.String("warm-start", "", "path to JSON weights to warm-start from (skips random init)")
+	warmStart      := flag.String("warm-start", "", "path to JSON weights to warm-start from (skips random init)")
+	warmHiddenOnly := flag.Bool("warm-hidden-only", false, "warm-start hidden layers only, reset output layer")
 	epochs     := flag.Int("epochs", 100, "Max training epochs")
 	batch      := flag.Int("batch", 4096, "Mini-batch size")
 	lr         := flag.Float64("lr", 1e-3, "Adam learning rate")
@@ -32,33 +33,37 @@ func main() {
 	wd         := flag.Float64("wd", 1e-4, "L2 weight decay")
 	patience   := flag.Int("patience", 5, "ReduceLROnPlateau patience")
 	minLR      := flag.Float64("min-lr", 1e-6, "Stop when LR drops below this")
+	minDelta   := flag.Float64("min-delta", 0.0, "Minimum relative MSE improvement to reset patience (e.g. 0.001)")
 	target     := flag.String("target", "score_delta", "Target column")
 	seed       := flag.Int64("seed", 42, "Random seed")
-	mode       := flag.String("mode", "card", "Training mode: card or bid")
+	mode        := flag.String("mode", "card", "Training mode: card or bid")
+	lrSchedule  := flag.String("lr-schedule", "plateau", "LR schedule: plateau or cosine")
+	cosineT0    := flag.Int("cosine-t0", 50, "Cosine annealing initial cycle length (epochs)")
+	cosineTMult := flag.Float64("cosine-tmult", 2.0, "Cosine annealing cycle length multiplier per restart")
 	flag.Parse()
 
 	rng := rand.New(rand.NewSource(*seed))
 
 	if *format == "bin" && *mode == "bid" {
-		runBidBinaryStreaming(rng, *dataPath, *outPath, *warmStart, *h1, *h2, *h3,
+		runBidBinaryStreaming(rng, *dataPath, *outPath, *warmStart, *warmHiddenOnly, *lrSchedule, *cosineT0, *cosineTMult, *h1, *h2, *h3,
 			*batch, *epochs, *patience, *valFrac,
-			float32(*lr), float32(*wd), float32(*minLR))
+			float32(*lr), float32(*wd), float32(*minLR), float32(*minDelta))
 	} else if *format == "bin" {
-		runBinaryStreaming(rng, *dataPath, *outPath, *warmStart, *target, *h1, *h2, *h3,
+		runBinaryStreaming(rng, *dataPath, *outPath, *warmStart, *target, *lrSchedule, *cosineT0, *cosineTMult, *h1, *h2, *h3,
 			*batch, *epochs, *patience, *valFrac,
-			float32(*lr), float32(*wd), float32(*minLR))
+			float32(*lr), float32(*wd), float32(*minLR), float32(*minDelta))
 	} else {
 		runCSV(rng, *dataPath, *outPath, *target, *h1, *h2, *h3,
 			*batch, *epochs, *patience, *valFrac,
-			float32(*lr), float32(*wd), float32(*minLR))
+			float32(*lr), float32(*wd), float32(*minLR), float32(*minDelta))
 	}
 }
 
 // runBinaryStreaming handles binary format with streaming (no full data in memory).
 // Pass 1: compute stats. Each epoch: re-read file, stream batches.
-func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath, target string,
+func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath, target, lrSchedule string, cosineT0 int, cosineTMult float64,
 	h1, h2, h3, batch, epochs, patience int, valFrac float64,
-	lr, wd, minLR float32) {
+	lr, wd, minLR, minDelta float32) {
 
 	nFeat := ml.TotalFeatureLen
 	fmt.Printf("Loading %s (format=bin, streaming) ...\n", dataPath)
@@ -124,6 +129,9 @@ func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath, target
 
 	currentLR := lr
 	plateauCount := 0
+	cosineMode := lrSchedule == "cosine"
+	cosineCurEpoch := 0
+	cosineCycleLen := cosineT0
 	preds := make([]float32, batch)
 
 	fmt.Printf("Model:  %d → %d → %d", nFeat, h1, h2)
@@ -135,8 +143,13 @@ func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath, target
 		nParams += h2 + 1
 	}
 	fmt.Printf(" → 1  (%d params)\n", nParams)
-	fmt.Printf("Config: lr=%.3f  wd=%.4f  batch=%d  max_epochs=%d  patience=%d\n\n",
-		currentLR, wd, batch, epochs, patience)
+	if cosineMode {
+		fmt.Printf("Config: lr=%.3f  wd=%.4f  batch=%d  max_epochs=%d  schedule=cosine(T0=%d,Tmult=%.0f)\n\n",
+			currentLR, wd, batch, epochs, cosineT0, cosineTMult)
+	} else {
+		fmt.Printf("Config: lr=%.3f  wd=%.4f  batch=%d  max_epochs=%d  patience=%d\n\n",
+			currentLR, wd, batch, epochs, patience)
+	}
 
 	fmt.Printf("%6s  %10s  %10s  %10s  %8s  %6s\n", "Epoch", "Train MSE", "Val MSE", "Val RMSE", "LR", "Time")
 	fmt.Println("--------------------------------------------------------------")
@@ -144,6 +157,12 @@ func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath, target
 	// --- Training loop: stream each epoch ---
 	for epoch := 1; epoch <= epochs; epoch++ {
 		epStart := time.Now()
+
+		// Compute LR for this epoch.
+		if cosineMode {
+			ratio := float64(cosineCurEpoch) / float64(cosineCycleLen)
+			currentLR = float32(float64(minLR) + 0.5*(float64(lr)-float64(minLR))*(1+math.Cos(math.Pi*ratio)))
+		}
 
 		f, err := os.Open(dataPath)
 		if err != nil { log.Fatal(err) }
@@ -221,25 +240,40 @@ func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath, target
 		valMSE := valLoss / float32(valN)
 		valRMSE := float32(math.Sqrt(float64(valMSE))) * yStd
 
+		improved := valMSE < bestValLoss*(1-minDelta)
 		marker := ""
-		if valMSE < bestValLoss {
+		if improved {
 			bestValLoss = valMSE
 			bestWeights = trainer.Finalize()
 			marker = " ◀"
-			plateauCount = 0
+		}
+
+		if cosineMode {
+			cosineCurEpoch++
+			if cosineCurEpoch >= cosineCycleLen {
+				cosineCurEpoch = 0
+				cosineCycleLen = int(float64(cosineCycleLen) * cosineTMult)
+				marker += " ↺"
+			}
 		} else {
-			plateauCount++
-			if plateauCount >= patience {
-				currentLR *= 0.5
+			if improved {
 				plateauCount = 0
+			} else {
+				plateauCount++
+				if plateauCount >= patience {
+					currentLR *= 0.5
+					plateauCount = 0
+				}
+			}
+			if currentLR < minLR {
+				fmt.Printf("%6d  %10.6f  %10.6f  %10.4f  %8.2e  %5.1fs%s\n",
+					epoch, trainMSE, valMSE, valRMSE, currentLR, time.Since(epStart).Seconds(), marker)
+				fmt.Printf("  Early stop: LR=%.2e reached minimum.\n", currentLR)
+				break
 			}
 		}
 		fmt.Printf("%6d  %10.6f  %10.6f  %10.4f  %8.2e  %5.1fs%s\n",
 			epoch, trainMSE, valMSE, valRMSE, currentLR, time.Since(epStart).Seconds(), marker)
-		if currentLR < minLR {
-			fmt.Printf("  Early stop: LR=%.2e reached minimum.\n", currentLR)
-			break
-		}
 	}
 
 	fmt.Printf("\nBest val MSE:  %.6f  (RMSE ≈ %.4f score points)\n",
@@ -254,9 +288,9 @@ func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath, target
 }
 
 // runBidBinaryStreaming handles binary format for bid training data (BidCollectRow).
-func runBidBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath string,
+func runBidBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath string, warmHiddenOnly bool, lrSchedule string, cosineT0 int, cosineTMult float64,
 	h1, h2, h3, batch, epochs, patience int, valFrac float64,
-	lr, wd, minLR float32) {
+	lr, wd, minLR, minDelta float32) {
 
 	nFeat := ml.BidTotalLen
 	fmt.Printf("Loading %s (format=bin, mode=bid, streaming) ...\n", dataPath)
@@ -307,7 +341,12 @@ func runBidBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath stri
 		} else if wsErr := trainer.LoadWeights(w.Weights()); wsErr != nil {
 			log.Printf("warm start skipped: %v", wsErr)
 		} else {
-			fmt.Printf("  Warm start: %s\n\n", warmStartPath)
+			if warmHiddenOnly {
+				trainer.ResetOutputLayer(rng)
+				fmt.Printf("  Warm start (hidden only): %s\n\n", warmStartPath)
+			} else {
+				fmt.Printf("  Warm start: %s\n\n", warmStartPath)
+			}
 		}
 	}
 
@@ -316,6 +355,9 @@ func runBidBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath stri
 
 	currentLR := lr
 	plateauCount := 0
+	cosineMode := lrSchedule == "cosine"
+	cosineCurEpoch := 0
+	cosineCycleLen := cosineT0
 	preds := make([]float32, batch)
 
 	fmt.Printf("Model:  %d → %d → %d", nFeat, h1, h2)
@@ -327,8 +369,13 @@ func runBidBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath stri
 		nParams += h2 + 1
 	}
 	fmt.Printf(" → 1  (%d params)\n", nParams)
-	fmt.Printf("Config: lr=%.3f  wd=%.4f  batch=%d  max_epochs=%d  patience=%d\n\n",
-		currentLR, wd, batch, epochs, patience)
+	if cosineMode {
+		fmt.Printf("Config: lr=%.3f  wd=%.4f  batch=%d  max_epochs=%d  schedule=cosine(T0=%d,Tmult=%.0f)\n\n",
+			currentLR, wd, batch, epochs, cosineT0, cosineTMult)
+	} else {
+		fmt.Printf("Config: lr=%.3f  wd=%.4f  batch=%d  max_epochs=%d  patience=%d\n\n",
+			currentLR, wd, batch, epochs, patience)
+	}
 
 	fmt.Printf("%6s  %10s  %10s  %10s  %8s  %6s\n", "Epoch", "Train MSE", "Val MSE", "Val RMSE", "LR", "Time")
 	fmt.Println("--------------------------------------------------------------")
@@ -336,6 +383,12 @@ func runBidBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath stri
 	// --- Training loop: stream each epoch ---
 	for epoch := 1; epoch <= epochs; epoch++ {
 		epStart := time.Now()
+
+		// Compute LR for this epoch.
+		if cosineMode {
+			ratio := float64(cosineCurEpoch) / float64(cosineCycleLen)
+			currentLR = float32(float64(minLR) + 0.5*(float64(lr)-float64(minLR))*(1+math.Cos(math.Pi*ratio)))
+		}
 
 		f, err := os.Open(dataPath)
 		if err != nil { log.Fatal(err) }
@@ -345,7 +398,6 @@ func runBidBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath stri
 		var trainN int64
 		var valLoss float32
 		var valN int64
-		batchCount := 0
 		rowIdx := int64(0)
 
 		processBatch := func(n int, isTrain bool) {
@@ -369,61 +421,92 @@ func runBidBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath stri
 		}
 
 		var row ml.BidCollectRow
-		inTrain := true
+		var trainBatch, valBatch int
+		trainBatchX := make([]float32, batch*nFeat)
+		valBatchX   := make([]float32, batch*nFeat)
+		trainBatchY := make([]float32, batch)
+		valBatchY   := make([]float32, batch)
+		flushTrain := func() {
+			if trainBatch > 0 {
+				copy(trainer.BatchX, trainBatchX[:trainBatch*nFeat])
+				copy(trainer.BatchY, trainBatchY[:trainBatch])
+				processBatch(trainBatch, true)
+				trainBatch = 0
+			}
+		}
+		flushVal := func() {
+			if valBatch > 0 {
+				copy(trainer.BatchX, valBatchX[:valBatch*nFeat])
+				copy(trainer.BatchY, valBatchY[:valBatch])
+				processBatch(valBatch, false)
+				valBatch = 0
+			}
+		}
 		for {
 			err := row.ReadBinary(rd)
 			if err == io.EOF { break }
 			if err != nil { log.Fatal(err) }
 
 			normTV := (row.ScoreDelta - yMean) / (yStd + 1e-8)
+			isVal := rowIdx % 10 == 0
 
-			if inTrain && rowIdx >= nTrain {
-				if batchCount > 0 {
-					processBatch(batchCount, true)
-					batchCount = 0
-				}
-				inTrain = false
+			if isVal {
+				dstOff := valBatch * nFeat
+				copy(valBatchX[dstOff:dstOff+nFeat], row.Features[:])
+				valBatchY[valBatch] = normTV
+				valBatch++
+				if valBatch >= batch { flushVal() }
+			} else {
+				dstOff := trainBatch * nFeat
+				copy(trainBatchX[dstOff:dstOff+nFeat], row.Features[:])
+				trainBatchY[trainBatch] = normTV
+				trainBatch++
+				if trainBatch >= batch { flushTrain() }
 			}
-
-			dstOff := batchCount * nFeat
-			copy(trainer.BatchX[dstOff:dstOff+nFeat], row.Features[:])
-			trainer.BatchY[batchCount] = normTV
-			batchCount++
 			rowIdx++
-
-			if batchCount >= batch {
-				processBatch(batchCount, inTrain)
-				batchCount = 0
-			}
 		}
-		if batchCount > 0 {
-			processBatch(batchCount, inTrain)
-		}
+		flushTrain()
+		flushVal()
 		f.Close()
 
 		trainMSE := trainLoss / float32(trainN)
 		valMSE := valLoss / float32(valN)
 		valRMSE := float32(math.Sqrt(float64(valMSE))) * yStd
 
+		improved := valMSE < bestValLoss*(1-minDelta)
 		marker := ""
-		if valMSE < bestValLoss {
+		if improved {
 			bestValLoss = valMSE
 			bestWeights = trainer.Finalize()
 			marker = " ◀"
-			plateauCount = 0
+		}
+
+		if cosineMode {
+			cosineCurEpoch++
+			if cosineCurEpoch >= cosineCycleLen {
+				cosineCurEpoch = 0
+				cosineCycleLen = int(float64(cosineCycleLen) * cosineTMult)
+				marker += " ↺"
+			}
 		} else {
-			plateauCount++
-			if plateauCount >= patience {
-				currentLR *= 0.5
+			if improved {
 				plateauCount = 0
+			} else {
+				plateauCount++
+				if plateauCount >= patience {
+					currentLR *= 0.5
+					plateauCount = 0
+				}
+			}
+			if currentLR < minLR {
+				fmt.Printf("%6d  %10.6f  %10.6f  %10.4f  %8.2e  %5.1fs%s\n",
+					epoch, trainMSE, valMSE, valRMSE, currentLR, time.Since(epStart).Seconds(), marker)
+				fmt.Printf("  Early stop: LR=%.2e reached minimum.\n", currentLR)
+				break
 			}
 		}
 		fmt.Printf("%6d  %10.6f  %10.6f  %10.4f  %8.2e  %5.1fs%s\n",
 			epoch, trainMSE, valMSE, valRMSE, currentLR, time.Since(epStart).Seconds(), marker)
-		if currentLR < minLR {
-			fmt.Printf("  Early stop: LR=%.2e reached minimum.\n", currentLR)
-			break
-		}
 	}
 
 	fmt.Printf("\nBest val MSE:  %.6f  (RMSE ≈ %.4f score points)\n",
@@ -440,7 +523,7 @@ func runBidBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath stri
 // runCSV handles CSV format with in-memory loading (two-pass).
 func runCSV(rng *rand.Rand, dataPath, outPath, target string,
 	h1, h2, h3, batch, epochs, patience int, valFrac float64,
-	lr, wd, minLR float32) {
+	lr, wd, minLR, minDelta float32) {
 
 	fmt.Printf("Loading %s (format=csv) ...\n", dataPath)
 	t0 := time.Now()
@@ -521,12 +604,12 @@ func runCSV(rng *rand.Rand, dataPath, outPath, target string,
 
 	runInMemoryTraining(rng, allX, allY, nFeat, int(nRows), int(nTrain), int(nVal),
 		yMean, yStd, h1, h2, h3, batch, epochs, patience,
-		lr, wd, minLR, outPath)
+		lr, wd, minLR, minDelta, outPath)
 }
 
 func runInMemoryTraining(rng *rand.Rand, allX, allY []float32, nFeat, nRows, nTrain, nVal int,
 	yMean, yStd float32, h1, h2, h3, batch, epochs, patience int,
-	lr, wd, minLR float32, outPath string) {
+	lr, wd, minLR, minDelta float32, outPath string) {
 
 	trainX := allX[:nTrain*nFeat]
 	trainY := allY[:nTrain]
@@ -631,7 +714,7 @@ func runInMemoryTraining(rng *rand.Rand, allX, allY []float32, nFeat, nRows, nTr
 		valRMSE := float32(math.Sqrt(float64(valMSE))) * yStd
 
 		marker := ""
-		if valMSE < bestValLoss {
+		if valMSE < bestValLoss*(1-minDelta) {
 			bestValLoss = valMSE
 			bestWeights = trainer.Finalize()
 			marker = " ◀"

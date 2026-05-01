@@ -84,6 +84,26 @@ type decisionPoint struct {
 	seatStep     int // this seat's step index within activeSeats for current trick
 }
 
+// dealBufPool provides reusable DealBuf scratch space for alloc-free card dealing.
+var dealBufPool = sync.Pool{
+	New: func() interface{} { return new(card.DealBuf) },
+}
+
+// bidRowsBufPool provides reusable backing arrays for CollectBidHand row slices.
+var bidRowsBufPool = sync.Pool{
+	New: func() interface{} { return make([]BidCollectRow, 0, 60) },
+}
+
+// validCardBufPool provides reusable scratch buffers for valid-play lists during rollouts.
+var validCardBufPool = sync.Pool{
+	New: func() interface{} { s := make([]card.Card, 0, 8); return &s },
+}
+
+// ReleaseBidRows returns a rows slice to the pool. Call this after consuming all rows.
+func ReleaseBidRows(rows []BidCollectRow) {
+	bidRowsBufPool.Put(rows[:0])
+}
+
 // handBufPool provides reusable [6][]card.Card arrays to eliminate per-rollout allocations.
 // Cap 10 (not 8) so pepper exchange can append 2 cards to the caller's hand in-place.
 var handBufPool = sync.Pool{
@@ -116,7 +136,7 @@ var allSeats = []int{0, 1, 2, 3, 4, 5}
 // rollout simulates the remainder of the hand from this decision point,
 // with forcedCard played by this seat, and all other decisions made by rolloutStrat.
 // Returns the score delta for the bidding team and whether the bid was made.
-func (dp decisionPoint) rollout(forcedCard card.Card, rolloutStrat [6]game.Strategy, rng *rand.Rand, validBuf *[]card.Card) (scoreDelta int, madeBid bool) {
+func (dp *decisionPoint) rollout(forcedCard card.Card, rolloutStrat *[6]game.Strategy, rng *rand.Rand, validBuf *[]card.Card) (scoreDelta int, madeBid bool) {
 	// Get a pooled buffer and copy hands into it — avoids per-rollout make() calls.
 	buf := handBufPool.Get().(*[6][]card.Card)
 	var hands [6][]card.Card
@@ -165,13 +185,13 @@ func (dp decisionPoint) rollout(forcedCard card.Card, rolloutStrat [6]game.Strat
 			History:     history,
 			Hand:        hands[nextSeat],
 		}
-		chosen := rolloutStrat[nextSeat].Play(nextSeat, valid, state)
+		chosen := rolloutStrat[nextSeat].Play(nextSeat, valid, &state)
 		trick.Add(chosen, nextSeat)
 		hands[nextSeat] = dropCardInPlace(hands[nextSeat], chosen)
 	}
 
 	// Record completed trick in history and update state.
-	history.RecordTrick(trick.Cards)
+	history.RecordTrick(trick.Cards[:trick.NCards])
 	winner := trick.Winner()
 	tricksTaken[winner]++
 	leader := winner
@@ -196,12 +216,12 @@ func (dp decisionPoint) rollout(forcedCard card.Card, rolloutStrat [6]game.Strat
 				History:     history,
 				Hand:        hands[s],
 			}
-			chosen := rolloutStrat[s].Play(s, valid, state)
+			chosen := rolloutStrat[s].Play(s, valid, &state)
 			trick.Add(chosen, s)
 			hands[s] = dropCardInPlace(hands[s], chosen)
 		}
 
-		history.RecordTrick(trick.Cards)
+		history.RecordTrick(trick.Cards[:trick.NCards])
 		winner = trick.Winner()
 		tricksTaken[winner]++
 		leader = winner
@@ -221,12 +241,6 @@ func (dp decisionPoint) rollout(forcedCard card.Card, rolloutStrat [6]game.Strat
 	return result.ScoreDelta[bidderTeam], result.MadeBid
 }
 
-var handPool = sync.Pool{
-	New: func() interface{} {
-		return new([6][]card.Card)
-	},
-}
-
 var trickSlicePool = sync.Pool{
 	New: func() interface{} {
 		return make([]game.PlayedCard, 0, 6)
@@ -234,10 +248,10 @@ var trickSlicePool = sync.Pool{
 }
 
 func copyHandsPooled(hands [6][]card.Card) *[6][]card.Card {
-	res := handPool.Get().(*[6][]card.Card)
+	res := handBufPool.Get().(*[6][]card.Card)
 	for i, h := range hands {
 		if cap((*res)[i]) < len(h) {
-			(*res)[i] = make([]card.Card, len(h))
+			(*res)[i] = make([]card.Card, len(h), len(h)+2)
 		} else {
 			(*res)[i] = (*res)[i][:len(h)]
 		}
@@ -247,7 +261,7 @@ func copyHandsPooled(hands [6][]card.Card) *[6][]card.Card {
 }
 
 func releaseHands(h *[6][]card.Card) {
-	handPool.Put(h)
+	handBufPool.Put(h)
 }
 
 // CollectHand runs one complete hand and returns counterfactual training rows.
@@ -260,7 +274,9 @@ func CollectHand(
 	rollouts int,
 ) []CollectRow {
 	// Deal.
-	hands := card.Deal(rng)
+	dealBuf := dealBufPool.Get().(*card.DealBuf)
+	hands := card.DealInto(dealBuf, rng)
+	defer dealBufPool.Put(dealBuf)
 
 	// Bid.
 	bidResult := game.RunBidding(
@@ -268,7 +284,7 @@ func CollectHand(
 		gs.Dealer,
 		gs.Scores,
 		func(seat int, state game.BidState) int {
-			return strategies[seat].Bid(seat, state)
+			return strategies[seat].Bid(seat, &state)
 		},
 	)
 	if bidResult.IsStuck {
@@ -298,8 +314,16 @@ func CollectHand(
 	tricksTaken := [6]int{}
 	leader := callerSeat
 	var history game.HandHistory
-	var validBuf []card.Card
-	rolloutBuf := make([]card.Card, 0, 8)
+	validBufPtr := validCardBufPool.Get().(*[]card.Card)
+	validBuf := (*validBufPtr)[:0]
+	rolloutBufPtr := validCardBufPool.Get().(*[]card.Card)
+	rolloutBuf := (*rolloutBufPtr)[:0]
+	defer func() {
+		*validBufPtr = validBuf[:0]
+		validCardBufPool.Put(validBufPtr)
+		*rolloutBufPtr = rolloutBuf[:0]
+		validCardBufPool.Put(rolloutBufPtr)
+	}()
 	rows := make([]CollectRow, 0, 8*len(activeSeats)*game.TotalTricks)
 
 	for t := 0; t < game.TotalTricks; t++ {
@@ -328,7 +352,7 @@ func CollectHand(
 			dp := decisionPoint{
 				seat:         seat,
 				hands:        *pooledHands,
-				trick:        copyPlayedCards(trick.Cards),
+				trick:        copyPlayedCards(trick.Cards[:trick.NCards]),
 				trickNum:     t,
 				tricksTaken:  tricksTaken,
 				historyCards: history.PlayedSlice(),
@@ -349,7 +373,7 @@ func CollectHand(
 				madeBidCount := 0
 				rolloutBuf = rolloutBuf[:0]
 				for r := 0; r < rollouts; r++ {
-					delta, made := dp.rollout(candidate, rolloutStrat, rng, &rolloutBuf)
+					delta, made := dp.rollout(candidate, &rolloutStrat, rng, &rolloutBuf)
 					totalDelta += float64(delta)
 					if made {
 						madeBidCount++
@@ -369,12 +393,12 @@ func CollectHand(
 			releaseHands(pooledHands)
 
 			// Play the actual card.
-			chosen := strategies[seat].Play(seat, valid, state)
+			chosen := strategies[seat].Play(seat, valid, &state)
 			trick.Add(chosen, seat)
 			hands[seat] = dropCardInPlace(hands[seat], chosen)
 		}
 
-		history.RecordTrick(trick.Cards)
+		history.RecordTrick(trick.Cards[:trick.NCards])
 		winner := trick.Winner()
 		tricksTaken[winner]++
 		leader = winner

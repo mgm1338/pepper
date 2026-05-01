@@ -1,0 +1,43 @@
+version: "2"
+
+# Go static analysis config for the pepper bot/training repo.
+# Run with: golangci-lint run
+
+run:
+  timeout: 3m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck       # unchecked errors
+    - govet          # standard go vet checks
+    - ineffassign    # detected unused assignments
+    - staticcheck    # broad static analysis (catches dead code, bad patterns)
+    - unused         # unused vars/funcs/types
+    - misspell       # common typos
+    - bodyclose      # http response bodies must be closed
+    - gocritic       # opinionated checks
+    - gosec          # security issues
+
+  settings:
+    gocritic:
+      disabled-checks:
+        - ifElseChain
+        - hugeParam
+
+  exclusions:
+    rules:
+      # generated/CSV-loading scripts can ignore close errors
+      - path: scripts/
+        linters:
+          - errcheck
+          - gosec
+      # tests are noisy with errcheck on os.Open etc.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+
+issues:
+  max-same-issues: 10

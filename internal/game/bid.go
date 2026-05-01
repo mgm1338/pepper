@@ -19,16 +19,17 @@ type BidResult struct {
 
 // BidState is the view passed to a strategy's Bid method.
 type BidState struct {
-	Hand          []card.Card // the bidding player's hand
-	Seat          int         // this player's seat
-	DealerSeat    int         // who is the dealer
-	CurrentHigh   int         // current highest bid (0 if no bids yet)
-	HighSeat      int         // seat holding the current high bid (-1 if no bids yet)
-	SeatsLeft     int         // seats remaining to bid after this one
-	Scores        [2]int      // current game scores
-	PassesSoFar    int         // number of players who have passed before this seat
-	PartnerHasBid  bool        // true if any teammate has placed a non-pass bid before this seat
-	PartnerBidLevel int        // bid level placed by a teammate (0 if no teammate has bid)
+	Hand            []card.Card // the bidding player's hand
+	Seat            int         // this player's seat
+	DealerSeat      int         // who is the dealer
+	CurrentHigh     int         // current highest bid (0 if no bids yet)
+	HighSeat        int         // seat holding the current high bid (-1 if no bids yet)
+	SeatsLeft       int         // seats remaining to bid after this one
+	Scores          [2]int      // current game scores
+	PassesSoFar     int         // number of players who have passed before this seat
+	PartnerHasBid   bool        // true if any teammate has placed a non-pass bid before this seat
+	PartnerBidLevel int         // bid level placed by a teammate (0 if no teammate has bid)
+	AllBids         [6]int      // bid level placed by each seat so far (0 = pass or not yet bid)
 }
 
 // RunBidding executes one round of bidding using the provided strategy callbacks.
@@ -83,6 +84,7 @@ func RunBidding(
 			PassesSoFar:     passesSoFar,
 			PartnerHasBid:   anyPartnerBid,
 			PartnerBidLevel: partnerBidLevel,
+			AllBids:         seatBidLevel,
 		}
 
 		bid := bidFn(seat, state)

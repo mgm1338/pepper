@@ -86,10 +86,7 @@ type PlayProfile struct {
 }
 
 // Config defines the tunable parameters for a StandardStrategy.
-// Different configs represent different player personalities.
 type Config struct {
-	Name string
-
 	// ── Bidding ────────────────────────────────────────────────────────────────
 
 	// PartnerTricksEstimate is how many tricks you expect your partner to contribute
@@ -231,145 +228,19 @@ type Config struct {
 	// EndgameTrickThreshold is how many tricks remaining triggers the Endgame profile.
 	// Compared to (8 - TrickNumber). 0 = disabled. Range 0–4.
 	EndgameTrickThreshold int
+
+	// TrumpMemory controls how much trump history the bot uses when deciding
+	// whether to keep pulling trump. 0=none, 1=right bowers only,
+	// 2=right+left bowers, 3=full exact count.
+	TrumpMemory int
+
+	// AceMemory controls whether the bot tracks which off-suit aces have been
+	// played. When true, a king whose ace has dropped is treated as a top card.
+	AceMemory bool
 }
 
-// conservativeProfile is the shared play profile for the Conservative preset.
-var conservativeProfile = PlayProfile{
-	LeadHigh:                         false,
-	PullTrumpWithRight:               true,
-	PullTrumpMinCount:                0,
-	CashAcesEarly:                    false,
-	VoidHunting:                      false,
-	DuckAndCover:                     true,
-	OvertrumpPartner:                 false,
-	DefensiveLeadRight:               false,
-	DefensiveSaveRight:               true,
-	DefensiveAvoidLeadingIntoHand:    true,
-	DefensiveTrumpWithRightThreshold: 0,
-	DefensiveTrumpLeadMin:            0,
-	DefensiveLeadKing:                false,
-	DefensiveLeadHigh:                false,
-	DefensiveHighFollow:              false,
-	DefensiveSacrificeLead:           false,
-}
-
-// aggressiveNormalProfile is the Normal play profile for the Aggressive preset.
-var aggressiveNormalProfile = PlayProfile{
-	LeadHigh:                         false,
-	PullTrumpWithRight:               true,
-	PullTrumpMinCount:                5,
-	CashAcesEarly:                    true,
-	VoidHunting:                      true,
-	DuckAndCover:                     true,
-	OvertrumpPartner:                 true,
-	DefensiveLeadRight:               true,
-	DefensiveSaveRight:               false,
-	DefensiveAvoidLeadingIntoHand:    false,
-	DefensiveTrumpWithRightThreshold: 3,
-	DefensiveTrumpLeadMin:            3,
-	DefensiveLeadKing:                true,
-	DefensiveLeadHigh:                true,
-	DefensiveHighFollow:              true,
-	DefensiveSacrificeLead:           true,
-}
-
-// Preset configs representing common player types.
-var (
-	Conservative = Config{
-		Name:                  "Conservative",
-		PartnerTricksEstimate: 1.0,
-		BidPadding:            0,
-		Bid5Threshold:         5.0,
-		Bid6Threshold:         0,
-		ScoreDeficitFactor:    0.0,
-		ScoreSurplusFactor:    0.01,
-		ScoreCloseoutBonus:    0.1,
-		SeatPositionBias:      0.0,
-		OvercallBias:          0.0,
-		OpeningBidFactor:      0.9,
-		RightBowerScore:       1.5,
-		LeftBowerScore:        1.2,
-		AceKingScore:          1.0,
-		LowTrumpScore:         0.5,
-		MajorSuitBonus:        0.0,
-		TrumpLengthBonus:      0.0,
-		PepperRequireBothRights: true,
-		PepperMinLeftBowers:     1,
-		PepperMinTrump:          7,
-		PepperDiscardKeepAces:   true,
-		// Conservative stays conservative regardless of situation.
-		Normal:                conservativeProfile,
-		Deficit:               conservativeProfile,
-		Endgame:               conservativeProfile,
-		DeficitRatio:          0.5,
-		EndgameTrickThreshold: 0,
-	}
-
-	Aggressive = Config{
-		Name:                  "Aggressive",
-		PartnerTricksEstimate: 1.5,
-		BidPadding:            0,
-		Bid5Threshold:         4.2,
-		Bid6Threshold:         5.5,
-		ScoreDeficitFactor:    0.02,
-		ScoreSurplusFactor:    0.0,
-		ScoreCloseoutBonus:    0.3,
-		SeatPositionBias:      0.05,
-		OvercallBias:          0.2,
-		OpeningBidFactor:      1.1,
-		RightBowerScore:       1.5,
-		LeftBowerScore:        1.2,
-		AceKingScore:          1.0,
-		LowTrumpScore:         0.5,
-		MajorSuitBonus:        0.1,
-		TrumpLengthBonus:      0.08,
-		PepperRequireBothRights: true,
-		PepperMinLeftBowers:     0,
-		PepperMinTrump:          6,
-		PepperDiscardKeepAces:   true,
-		Normal: aggressiveNormalProfile,
-		Deficit: PlayProfile{
-			LeadHigh:                         true, // full aggression when behind
-			PullTrumpWithRight:               true,
-			PullTrumpMinCount:                5,
-			CashAcesEarly:                    true,
-			VoidHunting:                      true,
-			DuckAndCover:                     true,
-			OvertrumpPartner:                 true,
-			DefensiveLeadRight:               true,
-			DefensiveSaveRight:               false,
-			DefensiveAvoidLeadingIntoHand:    false,
-			DefensiveTrumpWithRightThreshold: 3,
-			DefensiveTrumpLeadMin:            3,
-			DefensiveLeadKing:                true,
-			DefensiveLeadHigh:                true,
-			DefensiveHighFollow:              true,
-			DefensiveSacrificeLead:           true,
-		},
-		Endgame: PlayProfile{
-			LeadHigh:                         true, // was EndgameLeadHigh=true
-			PullTrumpWithRight:               true,
-			PullTrumpMinCount:                5,
-			CashAcesEarly:                    true,
-			VoidHunting:                      true,
-			DuckAndCover:                     false, // endgame skips duck-and-cover
-			OvertrumpPartner:                 true,
-			DefensiveLeadRight:               true,
-			DefensiveSaveRight:               false,
-			DefensiveAvoidLeadingIntoHand:    false,
-			DefensiveTrumpWithRightThreshold: 3,
-			DefensiveTrumpLeadMin:            3,
-			DefensiveLeadKing:                true,
-			DefensiveLeadHigh:                true,
-			DefensiveHighFollow:              true,
-			DefensiveSacrificeLead:           true,
-		},
-		DeficitRatio:          0.5,
-		EndgameTrickThreshold: 2,
-	}
-
-	Balanced = Config{
-		Name: "Balanced",
+// Balanced is the evolved rule-based config, cross-validated across seeds 123/456/789.
+var Balanced = Config{
 		// Cross-validated: seeds 123, 456, 789 — 34-param space, ~66M hands total.
 		// PartnerTricksEstimate works in tandem with OpeningBidFactor: when opening the
 		// auction (no prior bids), effective partner estimate = 1.16 * 0.73 ≈ 0.85,
@@ -453,92 +324,9 @@ var (
 		},
 		DeficitRatio:          0.73, // v2 evolver seed 123 (was 0.50)
 		EndgameTrickThreshold: 1,    // v2 evolver seed 123 (stable)
-	}
-
-	// BalancedV1 is the previous Balanced preset, cross-validated across seeds 42/99/777
-	// using the 22-param space. Kept for head-to-head benchmarking against Balanced.
-	BalancedV1 = Config{
-		Name:                  "BalancedV1",
-		PartnerTricksEstimate: 1.97,
-		BidPadding:            -1,
-		Bid5Threshold:         4.50,
-		Bid6Threshold:         0,
-		ScoreDeficitFactor:    0.035,
-		ScoreSurplusFactor:    0.030,
-		ScoreCloseoutBonus:    0.0,
-		SeatPositionBias:      0.05,
-		OvercallBias:          0.25,
-		OpeningBidFactor:      1.0,
-		RightBowerScore:       1.5,
-		LeftBowerScore:        1.2,
-		AceKingScore:          1.0,
-		LowTrumpScore:         0.5,
-		MajorSuitBonus:        0.21,
-		TrumpLengthBonus:      0.0,
-		PepperRequireBothRights: true,
-		PepperMinLeftBowers:     0,
-		PepperMinTrump:          6,
-		PepperDiscardKeepAces:   false,
-		// V1 had TrickDeficitAggression=false, EndgameTrickThreshold=0.
-		// All three profiles are the same: no situational adaptation.
-		Normal: PlayProfile{
-			LeadHigh:                         false,
-			PullTrumpWithRight:               true,
-			PullTrumpMinCount:                6,
-			CashAcesEarly:                    false,
-			VoidHunting:                      false,
-			DuckAndCover:                     true,
-			OvertrumpPartner:                 false,
-			DefensiveLeadRight:               false,
-			DefensiveSaveRight:               false,
-			DefensiveAvoidLeadingIntoHand:    false,
-			DefensiveTrumpWithRightThreshold: 0,
-			DefensiveTrumpLeadMin:            0,
-			DefensiveLeadKing:                false,
-			DefensiveLeadHigh:                false,
-			DefensiveHighFollow:              false,
-			DefensiveSacrificeLead:           false,
-		},
-		Deficit: PlayProfile{
-			LeadHigh:                         false, // V1 had no deficit aggression
-			PullTrumpWithRight:               true,
-			PullTrumpMinCount:                6,
-			CashAcesEarly:                    false,
-			VoidHunting:                      false,
-			DuckAndCover:                     true,
-			OvertrumpPartner:                 false,
-			DefensiveLeadRight:               false,
-			DefensiveSaveRight:               false,
-			DefensiveAvoidLeadingIntoHand:    false,
-			DefensiveTrumpWithRightThreshold: 0,
-			DefensiveTrumpLeadMin:            0,
-			DefensiveLeadKing:                false,
-			DefensiveLeadHigh:                false,
-			DefensiveHighFollow:              false,
-			DefensiveSacrificeLead:           false,
-		},
-		Endgame: PlayProfile{
-			LeadHigh:                         false,
-			PullTrumpWithRight:               true,
-			PullTrumpMinCount:                6,
-			CashAcesEarly:                    false,
-			VoidHunting:                      false,
-			DuckAndCover:                     true,
-			OvertrumpPartner:                 false,
-			DefensiveLeadRight:               false,
-			DefensiveSaveRight:               false,
-			DefensiveAvoidLeadingIntoHand:    false,
-			DefensiveTrumpWithRightThreshold: 0,
-			DefensiveTrumpLeadMin:            0,
-			DefensiveLeadKing:                false,
-			DefensiveLeadHigh:                false,
-			DefensiveHighFollow:              false,
-			DefensiveSacrificeLead:           false,
-		},
-		DeficitRatio:          0.5,
-		EndgameTrickThreshold: 0,
-	}
-)
+		TrumpMemory:           3,
+		AceMemory:             true,
+}
 
 // StandardStrategy implements game.Strategy using a Config.
 type StandardStrategy struct {
@@ -549,9 +337,55 @@ func NewStandard(cfg Config) *StandardStrategy {
 	return &StandardStrategy{cfg: cfg}
 }
 
+// BidAnalysis holds a breakdown of Balanced's bidding reasoning for a hand.
+type BidAnalysis struct {
+	BestSuit      card.Suit // trump suit Balanced would choose
+	HandTricks    float64   // tricks estimated from own cards alone
+	PartnerTricks float64   // expected partner contribution (after opening/overcall factor)
+	TotalEstimate float64   // sum before BidPadding; includes score/position adjustments
+	Bid           int       // final recommended bid (0=pass, 8=pepper)
+}
+
+// AnalyzeBid returns Balanced's full bidding breakdown for this hand and state.
+func (s *StandardStrategy) AnalyzeBid(seat int, state *game.BidState) BidAnalysis {
+	bestSuit, eval := s.bestTrumpWithBias(state.Hand)
+
+	partnerEst := s.cfg.PartnerTricksEstimate
+	if state.CurrentHigh == 0 {
+		partnerEst *= s.cfg.OpeningBidFactor
+	} else {
+		partnerEst += s.cfg.OvercallBias
+	}
+
+	total := eval + partnerEst
+	bidOrder := (seat - state.DealerSeat + 6) % 6
+	total += float64(bidOrder) * s.cfg.SeatPositionBias
+
+	myTeam := game.TeamOf(seat)
+	myScore := state.Scores[myTeam]
+	theirScore := state.Scores[1-myTeam]
+	deficit := float64(theirScore - myScore)
+	if deficit > 0 {
+		total += deficit * s.cfg.ScoreDeficitFactor
+	} else {
+		total -= float64(myScore-theirScore) * s.cfg.ScoreSurplusFactor
+	}
+	if myScore >= 48 || theirScore >= 48 {
+		total += s.cfg.ScoreCloseoutBonus
+	}
+
+	return BidAnalysis{
+		BestSuit:      bestSuit,
+		HandTricks:    eval,
+		PartnerTricks: partnerEst,
+		TotalEstimate: total,
+		Bid:           s.Bid(seat, state),
+	}
+}
+
 // --- Bidding ---
 
-func (s *StandardStrategy) Bid(seat int, state game.BidState) int {
+func (s *StandardStrategy) Bid(seat int, state *game.BidState) int {
 	_, eval := s.bestTrumpWithBias(state.Hand)
 
 	partnerEst := s.cfg.PartnerTricksEstimate
@@ -703,25 +537,25 @@ func (s *StandardStrategy) suitScore(hand []card.Card, trump card.Suit) float64 
 
 // --- Play dispatch ---
 
-func (s *StandardStrategy) Play(seat int, validPlays []card.Card, state game.TrickState) card.Card {
+func (s *StandardStrategy) Play(seat int, validPlays []card.Card, state *game.TrickState) card.Card {
 	trump := state.Trump
 	isPepper := state.BidAmount == game.PepperBid
 
 	if isPepper && seat == state.BidderSeat {
-		if len(state.Trick.Cards) == 0 {
+		if state.Trick.NCards == 0 {
 			return s.pepperCallerLead(validPlays, trump)
 		}
 		return s.pepperCallerFollow(validPlays, state, trump)
 	}
 
 	if isPepper {
-		if len(state.Trick.Cards) == 0 {
+		if state.Trick.NCards == 0 {
 			return s.pepperOpponentLead(validPlays, trump)
 		}
 		return s.pepperOpponentFollow(validPlays, state, trump)
 	}
 
-	if len(state.Trick.Cards) == 0 {
+	if state.Trick.NCards == 0 {
 		return s.chooseLead(seat, validPlays, state, trump)
 	}
 	return s.chooseFollow(seat, validPlays, state, trump)
@@ -729,7 +563,7 @@ func (s *StandardStrategy) Play(seat int, validPlays []card.Card, state game.Tri
 
 // selectProfile returns the appropriate PlayProfile for the current game state.
 // Endgame takes priority over Deficit when both conditions are satisfied.
-func (s *StandardStrategy) selectProfile(state game.TrickState) *PlayProfile {
+func (s *StandardStrategy) selectProfile(state *game.TrickState) *PlayProfile {
 	tricksLeft := 8 - state.TrickNumber
 
 	// Endgame check (highest priority).
@@ -757,7 +591,7 @@ func (s *StandardStrategy) selectProfile(state game.TrickState) *PlayProfile {
 	return &s.cfg.Normal
 }
 
-func (s *StandardStrategy) chooseLead(seat int, hand []card.Card, state game.TrickState, trump card.Suit) card.Card {
+func (s *StandardStrategy) chooseLead(seat int, hand []card.Card, state *game.TrickState, trump card.Suit) card.Card {
 	isBiddingTeam := game.TeamOf(seat) == game.TeamOf(state.BidderSeat)
 	p := s.selectProfile(state)
 
@@ -823,15 +657,16 @@ func (s *StandardStrategy) chooseLead(seat int, hand []card.Card, state game.Tri
 			if c, ok := offSuitAce(hand, trump); ok {
 				return c
 			}
+			if s.cfg.AceMemory {
+				if c, ok := topOffSuitWinner(hand, trump, state.History); ok {
+					return c
+				}
+			}
 		}
 
 		// 3. Keep pulling trump while opponents appear to still have trump.
 		if trumpCount > 0 {
-			trumpRemaining := 14
-			if state.History != nil {
-				trumpRemaining = state.History.TrumpRemaining(trump)
-			}
-			opponentTrumpEst := trumpRemaining - trumpCount - 1
+			opponentTrumpEst := s.estimateOpponentTrump(trumpCount, trump, state.History)
 			if opponentTrumpEst > 0 && trumpCount >= p.PullTrumpMinCount {
 				c, _ := lowestTrumpInHand(hand, trump)
 				return c
@@ -841,6 +676,13 @@ func (s *StandardStrategy) chooseLead(seat int, hand []card.Card, state game.Tri
 		// 4. Off-suit ace.
 		if c, ok := offSuitAce(hand, trump); ok {
 			return c
+		}
+
+		// 4b. King whose ace has dropped (only with AceMemory).
+		if s.cfg.AceMemory {
+			if c, ok := topOffSuitWinner(hand, trump, state.History); ok {
+				return c
+			}
 		}
 
 		// 5. Left bower — only if we also have the right.
@@ -910,6 +752,12 @@ func (s *StandardStrategy) chooseLead(seat int, hand []card.Card, state game.Tri
 		if c, ok := offSuitAce(hand, trump); ok {
 			return c
 		}
+		// King whose ace has dropped is now a top card — lead it.
+		if s.cfg.AceMemory {
+			if c, ok := topOffSuitWinner(hand, trump, state.History); ok {
+				return c
+			}
+		}
 		if p.DefensiveLeadKing {
 			if c, ok := offSuitKing(hand, trump); ok {
 				return c
@@ -935,7 +783,7 @@ func (s *StandardStrategy) chooseLead(seat int, hand []card.Card, state game.Tri
 	return hand[0]
 }
 
-func (s *StandardStrategy) chooseFollow(seat int, hand []card.Card, state game.TrickState, trump card.Suit) card.Card {
+func (s *StandardStrategy) chooseFollow(seat int, hand []card.Card, state *game.TrickState, trump card.Suit) card.Card {
 	trick := state.Trick
 	currentWinner := trick.Winner()
 	partnerWinning := game.TeamOf(currentWinner) == game.TeamOf(seat)
@@ -997,11 +845,11 @@ func (s *StandardStrategy) pepperCallerLead(hand []card.Card, trump card.Suit) c
 	return hand[0]
 }
 
-func (s *StandardStrategy) pepperCallerFollow(hand []card.Card, state game.TrickState, trump card.Suit) card.Card {
+func (s *StandardStrategy) pepperCallerFollow(hand []card.Card, state *game.TrickState, trump card.Suit) card.Card {
 	trick := state.Trick
 	winSeat := trick.Winner()
 	var winCard card.Card
-	for _, pc := range trick.Cards {
+	for _, pc := range trick.Cards[:trick.NCards] {
 		if pc.Seat == winSeat {
 			winCard = pc.Card
 			break
@@ -1064,11 +912,11 @@ func (s *StandardStrategy) pepperOpponentLead(hand []card.Card, trump card.Suit)
 	return hand[0]
 }
 
-func (s *StandardStrategy) pepperOpponentFollow(hand []card.Card, state game.TrickState, trump card.Suit) card.Card {
+func (s *StandardStrategy) pepperOpponentFollow(hand []card.Card, state *game.TrickState, trump card.Suit) card.Card {
 	trick := state.Trick
 	winSeat := trick.Winner()
 	var winCard card.Card
-	for _, pc := range trick.Cards {
+	for _, pc := range trick.Cards[:trick.NCards] {
 		if pc.Seat == winSeat {
 			winCard = pc.Card
 			break
@@ -1199,6 +1047,52 @@ func twoLowestByTrumpRank(hand []card.Card, trump card.Suit) (card.Card, card.Ca
 		}
 	}
 	return first, second
+}
+
+// estimateOpponentTrump returns how many trump cards opponents likely still hold,
+// using as much history as TrumpMemory allows.
+func (s *StandardStrategy) estimateOpponentTrump(myTrumpCount int, trump card.Suit, history *game.HandHistory) int {
+	trumpRemaining := 14
+	if history != nil {
+		switch s.cfg.TrumpMemory {
+		case 1:
+			trumpRemaining = 14 - history.RightBowersPlayed(trump)
+		case 2:
+			trumpRemaining = 14 - history.RightBowersPlayed(trump) - history.LeftBowersPlayed(trump)
+		case 3:
+			trumpRemaining = history.TrumpRemaining(trump)
+		}
+	}
+	est := trumpRemaining - myTrumpCount - 1
+	if est < 0 {
+		est = 0
+	}
+	return est
+}
+
+// topOffSuitWinner returns a king in hand whose ace of the same suit has already
+// been played (making the king the current top card of that suit).
+// Only meaningful when AceMemory is enabled.
+func topOffSuitWinner(hand []card.Card, trump card.Suit, history *game.HandHistory) (card.Card, bool) {
+	if history == nil {
+		return card.Card{}, false
+	}
+	for _, c := range hand {
+		if c.Rank != card.King || card.TrumpRank(c, trump) >= 0 {
+			continue
+		}
+		// Check if both aces of this suit have been played.
+		acesPlayed := 0
+		for _, p := range history.PlayedSlice() {
+			if p.Suit == c.Suit && p.Rank == card.Ace && card.TrumpRank(p, trump) < 0 {
+				acesPlayed++
+			}
+		}
+		if acesPlayed >= 2 {
+			return c, true
+		}
+	}
+	return card.Card{}, false
 }
 
 // --- Helpers ---
