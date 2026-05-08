@@ -19,24 +19,52 @@ const maxHandCards = 48
 // Passed to every strategy call so bots can reason about what is still live.
 // The fixed-size array avoids heap allocation as the history grows.
 type HandHistory struct {
-	played [maxHandCards]card.Card
-	n      int
+	played    [maxHandCards]card.Card
+	n         int
+	trump     card.Suit
+	seatVoids [6]uint8 // bitmask per seat: bit i set if seat is known void in suit i
 }
 
-// Reset clears the history for reuse (e.g. from a sync.Pool).
-// Only resets the count — the underlying array is not zeroed.
-func (h *HandHistory) Reset() { h.n = 0 }
+// Reset clears per-hand state for reuse (e.g. from a sync.Pool).
+// Trump must be re-set via SetTrump after Reset.
+func (h *HandHistory) Reset() {
+	h.n = 0
+	h.seatVoids = [6]uint8{}
+}
+
+// SetTrump records the trump suit for this hand. Must be called before RecordTrick.
+func (h *HandHistory) SetTrump(trump card.Suit) { h.trump = trump }
+
+// Voids returns a snapshot of the per-seat void bitmasks.
+func (h *HandHistory) Voids() [6]uint8 { return h.seatVoids }
+
+// SetVoids restores a previously-captured void snapshot (used when resuming a rollout).
+func (h *HandHistory) SetVoids(v [6]uint8) { h.seatVoids = v }
+
+// IsVoidInSuit reports whether seat has been shown void in the given suit.
+func (h *HandHistory) IsVoidInSuit(seat int, suit card.Suit) bool {
+	return h.seatVoids[seat]&(1<<uint(suit)) != 0
+}
 
 // Record adds cards to the history. Called after each trick completes.
+// Does not update void tracking (no seat info); use RecordTrick for that.
 func (h *HandHistory) Record(cards []card.Card) {
 	h.n += copy(h.played[h.n:], cards)
 }
 
-// RecordTrick adds the cards from a completed trick directly, avoiding an intermediate slice.
+// RecordTrick adds the cards from a completed trick and updates per-seat void tracking.
+// cards[0] is the lead card; any follower that plays a different effective suit is void in the led suit.
 func (h *HandHistory) RecordTrick(cards []PlayedCard) {
+	if len(cards) == 0 {
+		return
+	}
+	ledSuit := card.EffectiveSuit(cards[0].Card, h.trump)
 	for _, pc := range cards {
 		h.played[h.n] = pc.Card
 		h.n++
+		if card.EffectiveSuit(pc.Card, h.trump) != ledSuit {
+			h.seatVoids[pc.Seat] |= 1 << uint(ledSuit)
+		}
 	}
 }
 
@@ -103,13 +131,11 @@ func (h *HandHistory) TrumpRemaining(trump card.Suit) int {
 }
 
 // IsTopTrump returns true if c is the highest unplayed trump card.
-// Useful for knowing when the left bower is now the best card.
 func (h *HandHistory) IsTopTrump(c card.Card, trump card.Suit) bool {
 	myRank := card.TrumpRank(c, trump)
 	if myRank < 0 {
 		return false
 	}
-	// Check if any higher-ranked trump card is still unplayed.
 	for _, t := range cachedTrumpCards[trump] {
 		if card.TrumpRank(t, trump) > myRank && !h.IsSeen(t) {
 			return false
@@ -118,9 +144,7 @@ func (h *HandHistory) IsTopTrump(c card.Card, trump card.Suit) bool {
 	return true
 }
 
-// SuitVoid returns true if no cards of the given effective suit remain unplayed
-// other than what is in the provided hand. Useful for knowing if leading a suit
-// is safe (opponents can only ruff, not follow).
+// CardsPlayedInSuit returns how many cards of the given effective suit have been played.
 func (h *HandHistory) CardsPlayedInSuit(suit card.Suit, trump card.Suit) int {
 	n := 0
 	for _, p := range h.played[:h.n] {
@@ -136,13 +160,10 @@ func (h *HandHistory) CardsPlayedInSuit(suit card.Suit, trump card.Suit) int {
 func buildTrumpCards(trump card.Suit) []card.Card {
 	partner := card.PartnerSuit(trump)
 	cards := make([]card.Card, 0, card.TotalTrumpCards)
-	// Right bowers (J of trump, copies 0 and 1).
 	cards = append(cards, card.Card{Suit: trump, Rank: card.Jack, CopyIndex: 0})
 	cards = append(cards, card.Card{Suit: trump, Rank: card.Jack, CopyIndex: 1})
-	// Left bowers (J of partner suit).
 	cards = append(cards, card.Card{Suit: partner, Rank: card.Jack, CopyIndex: 0})
 	cards = append(cards, card.Card{Suit: partner, Rank: card.Jack, CopyIndex: 1})
-	// Remaining trump ranks: A, K, Q, 10, 9 (copies 0 and 1 each).
 	for _, rank := range []card.Rank{card.Ace, card.King, card.Queen, card.Ten, card.Nine} {
 		cards = append(cards, card.Card{Suit: trump, Rank: rank, CopyIndex: 0})
 		cards = append(cards, card.Card{Suit: trump, Rank: rank, CopyIndex: 1})

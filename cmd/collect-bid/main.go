@@ -46,6 +46,7 @@ func main() {
 	modelPath    := flag.String("model", "", "path to card-play model_weights.json for rollouts")
 	bidModelPath := flag.String("bid-model", "", "path to bid_model_weights.json for rollouts")
 	epsilon      := flag.Float64("epsilon", 0.0, "probability of playing a random card during rollouts")
+	topK         := flag.Int("top-k", 0, "pre-screen bid candidates with model, run rollouts on top K only (0=all)")
 	flag.Parse()
 
 	var cardModel *ml.MLP
@@ -144,7 +145,11 @@ func main() {
 			for {
 				handIdx := int(nextHand.Add(1)) - 1
 				if handIdx >= *n { break }
-				rows := ml.CollectBidHand(handIdx, gs, strats, rolloutStrats, rng, *rollouts)
+				rows := ml.CollectBidHand(handIdx, gs, strats, rolloutStrats, rng, ml.BidCollectOpts{
+					Rollouts: *rollouts,
+					TopK:     *topK,
+					Screener: bidModel,
+				})
 				if len(rows) > 0 { rowCh <- rows }
 				gs.NextDealer()
 				localCount++

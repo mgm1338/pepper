@@ -9,13 +9,13 @@ import (
 // choices at a decision point, followed by CardFeatureLen card-specific features appended
 // once per candidate card. One training row = one (decision point, candidate card) pair.
 const (
-	ContextFeatureLen = 40
-	CardFeatureLen    = 7
+	ContextFeatureLen = 74
+	CardFeatureLen    = 8
 	TotalFeatureLen   = ContextFeatureLen + CardFeatureLen
 )
 
 // FeatureNames provides human-readable column names for the full feature vector.
-// Indices 0–39 are context, 40–46 are per-card.
+// Indices 0–73 are context, 74–81 are per-card.
 var FeatureNames = [TotalFeatureLen]string{
 	// Position / role (0–3)
 	"seat_rel_bidder",   // (seat - bidderSeat + 6) % 6, normalized 0–1
@@ -75,14 +75,52 @@ var FeatureNames = [TotalFeatureLen]string{
 	"i_can_beat_winner",         // 1 if I hold any card that beats the current winner
 	"partner_winning_unbeatable", // 1 if partner is winning with an unbeatable card
 
-	// Per-card features (40–46)
-	"card_is_trump",         // 1 if candidate card is trump
-	"card_rank_norm",        // trump rank / 13 if trump, else off-suit rank / 6
-	"card_is_top",           // 1 if candidate is the current top unplayed trump
-	"can_beat_winner",       // 1 if this card beats the current trick leader
-	"is_overtrump",          // 1 if card is trump and current winner is also trump
-	"card_suit_count",       // cards of this suit in my hand / 8
-	"card_is_top_in_suit",   // 1 if no higher-ranked card of this non-trump suit remains unplayed
+	// Off-suit field knowledge (40–44)
+	"offsuit1_remaining",  // remaining cards in non-trump suit 1 (suit order 0-3, skipping trump) / 12
+	"offsuit2_remaining",  // remaining cards in non-trump suit 2 / 12
+	"offsuit3_remaining",  // remaining cards in non-trump suit 3 / 12
+	"led_card_rank_norm",  // rank of led card normalized (0 if leading)
+	"led_suit_remaining",  // remaining cards in led suit / 12 (0 if leading)
+
+	// Void knowledge (45–50)
+	"partner_void_1",    // fraction of partners void in off-suit 1 (0, 0.5, 1.0)
+	"partner_void_2",    // fraction of partners void in off-suit 2
+	"partner_void_3",    // fraction of partners void in off-suit 3
+	"opp_void_count_1",  // fraction of opponents void in off-suit 1 (0–1)
+	"opp_void_count_2",  // fraction of opponents void in off-suit 2
+	"opp_void_count_3",  // fraction of opponents void in off-suit 3
+
+	// Trick dynamics (51–55)
+	"partner_has_played",      // 1 if any partner has already played in this trick
+	"suit_led_is_trump",       // 1 if the led card is trump (0 if leading)
+	"trump_in_current_trick",  // trump cards played so far this trick / 6
+	"top_of_led_suit_in_hand", // 1 if I hold the highest remaining card of the led suit (0 if leading)
+	"winner_seat_rel_norm",    // (winner_seat - seat + 6) % 6 / 5 (0 if leading)
+
+	// Per-seat void flags (56–70): for each of 5 relative seats, void in off-suits 1/2/3
+	// Relative seat order: (seat+1)%6, (seat+2)%6, (seat+3)%6, (seat+4)%6, (seat+5)%6
+	"seat1_void_1", "seat1_void_2", "seat1_void_3",
+	"seat2_void_1", "seat2_void_2", "seat2_void_3",
+	"seat3_void_1", "seat3_void_2", "seat3_void_3",
+	"seat4_void_1", "seat4_void_2", "seat4_void_3",
+	"seat5_void_1", "seat5_void_2", "seat5_void_3",
+
+	// Trick leader identity (71–72)
+	"led_by_bidder",  // 1 if the trick was led by the bidder (0 when leading)
+	"led_by_partner", // 1 if the trick was led by one of my partners (0 when leading)
+
+	// Recent trump density (73)
+	"trump_rate_recent", // fraction of trump in the last 2 completed tricks (0 if fewer than 1 trick done)
+
+	// Per-card features (74–81)
+	"card_is_trump",          // 1 if candidate card is trump
+	"card_rank_norm",         // trump rank / 13 if trump, else off-suit rank / 6
+	"card_is_top",            // 1 if candidate is the current top unplayed trump
+	"can_beat_winner",        // 1 if this card beats the current trick leader
+	"is_overtrump",           // 1 if card is trump and current winner is also trump
+	"card_suit_count",        // cards of this suit in my hand / 8
+	"card_is_top_in_suit",    // 1 if no higher-ranked card of this non-trump suit remains unplayed
+	"card_suit_remaining",    // remaining cards of this card's effective suit globally / 12
 }
 
 // ExtractContext builds the 37 shared context features for a play decision.
@@ -412,8 +450,220 @@ func ExtractContext(seat int, hand []card.Card, state game.TrickState, activePla
 		i += 3 // winner_is_unbeatable, i_can_beat_winner, partner_winning_unbeatable all 0 when leading
 	}
 
-	_ = i // i == ContextFeatureLen here
+	// --- Off-suit field knowledge (40–44) ---
+	// Enumerate the 3 non-trump suits in suit-index order (0-3, skip trump).
+	var offSuits [3]card.Suit
+	offIdx := 0
+	for s := card.Suit(0); s < 4; s++ {
+		if s != trump {
+			offSuits[offIdx] = s
+			offIdx++
+		}
+	}
+	for oi := 0; oi < 3; oi++ {
+		total := offSuitCardCount(offSuits[oi], trump)
+		played := h.CardsPlayedInSuit(offSuits[oi], trump)
+		rem := total - played
+		if rem < 0 {
+			rem = 0
+		}
+		f[i] = float32(rem) / 12.0
+		i++ // offsuit1/2/3_remaining
+	}
+
+	if cardsInTrick > 0 {
+		ledCard := trick.Cards[0].Card
+		ledSuit := card.EffectiveSuit(ledCard, trump)
+		ledTR := card.TrumpRank(ledCard, trump)
+		if ledTR >= 0 {
+			f[i] = float32(ledTR) / card.TrumpRankRight
+		} else {
+			f[i] = float32(card.NonTrumpRank(ledCard)) / card.NonTrumpRankAce
+		}
+		i++ // led_card_rank_norm
+
+		total := offSuitCardCount(ledSuit, trump)
+		played := h.CardsPlayedInSuit(ledSuit, trump)
+		rem := total - played
+		if rem < 0 {
+			rem = 0
+		}
+		f[i] = float32(rem) / 12.0
+		i++ // led_suit_remaining
+	} else {
+		i += 2 // led_card_rank_norm, led_suit_remaining both 0 when leading
+	}
+
+	// --- Void knowledge (45–50) ---
+	partners := game.Partners(seat)
+	for oi := 0; oi < 3; oi++ {
+		s := offSuits[oi]
+		voidCount := 0
+		for _, p := range partners {
+			if h.IsVoidInSuit(p, s) {
+				voidCount++
+			}
+		}
+		f[i] = float32(voidCount) / float32(len(partners))
+		i++ // partner_void_1/2/3
+	}
+	for oi := 0; oi < 3; oi++ {
+		s := offSuits[oi]
+		voidCount := 0
+		for opp := 0; opp < 6; opp++ {
+			if opp != seat && game.TeamOf(opp) != myTeam && h.IsVoidInSuit(opp, s) {
+				voidCount++
+			}
+		}
+		f[i] = float32(voidCount) / 4.0
+		i++ // opp_void_count_1/2/3
+	}
+
+	// --- Trick dynamics (51–55) ---
+	partnerPlayed := false
+	for _, p := range game.Partners(seat) {
+		for _, pc := range trick.Cards[:trick.NCards] {
+			if pc.Seat == p {
+				partnerPlayed = true
+				break
+			}
+		}
+	}
+	if partnerPlayed {
+		f[i] = 1.0
+	}
+	i++ // partner_has_played
+
+	if cardsInTrick > 0 {
+		ledSuit := card.EffectiveSuit(trick.Cards[0].Card, trump)
+		if ledSuit == trump {
+			f[i] = 1.0
+		}
+		i++ // suit_led_is_trump
+
+		trumpInTrick := 0
+		for _, pc := range trick.Cards[:trick.NCards] {
+			if card.TrumpRank(pc.Card, trump) >= 0 {
+				trumpInTrick++
+			}
+		}
+		f[i] = float32(trumpInTrick) / 6.0
+		i++ // trump_in_current_trick
+
+		// top_of_led_suit_in_hand: do I hold the highest remaining card of the led suit?
+		ledEffSuit := card.EffectiveSuit(trick.Cards[0].Card, trump)
+		topInLedSuit := false
+		if card.TrumpRank(trick.Cards[0].Card, trump) >= 0 {
+			// Led suit is trump — check if I hold the top trump
+			for _, hc := range hand {
+				if card.TrumpRank(hc, trump) >= 0 && h.IsTopTrump(hc, trump) {
+					topInLedSuit = true
+					break
+				}
+			}
+		} else {
+			// Off-suit led — find highest remaining card of that suit in hand
+			myBest := -1
+			for _, hc := range hand {
+				if card.EffectiveSuit(hc, trump) == ledEffSuit {
+					r := card.NonTrumpRank(hc)
+					if r > myBest {
+						myBest = r
+					}
+				}
+			}
+			if myBest >= 0 {
+				// Check if any higher card of the led suit is still unseen
+				isTop := true
+			topCheck:
+				for _, r := range []card.Rank{card.Nine, card.Ten, card.Jack, card.Queen, card.King, card.Ace} {
+					higher := card.Card{Suit: ledEffSuit, Rank: r}
+					if card.NonTrumpRank(higher) > myBest && card.TrumpRank(higher, trump) < 0 {
+						for ci := 0; ci < 2; ci++ {
+							if !h.IsSeen(card.Card{Suit: ledEffSuit, Rank: r, CopyIndex: ci}) {
+								isTop = false
+								break topCheck
+							}
+						}
+					}
+				}
+				topInLedSuit = isTop
+			}
+		}
+		if topInLedSuit {
+			f[i] = 1.0
+		}
+		i++ // top_of_led_suit_in_hand
+
+		f[i] = float32((trick.Winner()-seat+6)%6) / 5.0
+		i++ // winner_seat_rel_norm
+	} else {
+		i += 4 // suit_led_is_trump, trump_in_current_trick, top_of_led_suit_in_hand, winner_seat_rel_norm all 0 when leading
+	}
+
+	// --- Per-seat void flags (56–70) ---
+	for relPos := 1; relPos <= 5; relPos++ {
+		otherSeat := (seat + relPos) % 6
+		for oi := 0; oi < 3; oi++ {
+			if h.IsVoidInSuit(otherSeat, offSuits[oi]) {
+				f[i] = 1.0
+			}
+			i++
+		}
+	}
+
+	// --- Trick leader identity (71–72) ---
+	if cardsInTrick > 0 {
+		leaderSeat := trick.Cards[0].Seat
+		if leaderSeat == bidderSeat {
+			f[i] = 1.0
+		}
+		i++ // led_by_bidder
+		for _, p := range game.Partners(seat) {
+			if leaderSeat == p {
+				f[i] = 1.0
+				break
+			}
+		}
+		i++ // led_by_partner
+	} else {
+		i += 2 // led_by_bidder, led_by_partner both 0 when leading
+	}
+
+	// --- Recent trump density (73) ---
+	{
+		recentTricks := state.TrickNumber
+		if recentTricks > 2 {
+			recentTricks = 2
+		}
+		if recentTricks > 0 {
+			recentCards := recentTricks * activePlayers
+			played := h.PlayedSlice()
+			if len(played) >= recentCards {
+				start := len(played) - recentCards
+				trumpInRecent := 0
+				for _, c := range played[start:] {
+					if card.TrumpRank(c, trump) >= 0 {
+						trumpInRecent++
+					}
+				}
+				f[i] = float32(trumpInRecent) / float32(recentCards)
+			}
+		}
+		i++ // trump_rate_recent
+	}
+
+	_ = i // i == ContextFeatureLen (74) here
 	return f
+}
+
+// offSuitCardCount returns the total cards of the given effective suit in a pinochle deck.
+// Partner suit loses its J to trump, so has 10 cards; other off-suits have 12.
+func offSuitCardCount(suit card.Suit, trump card.Suit) int {
+	if suit == card.PartnerSuit(trump) {
+		return 10
+	}
+	return 12
 }
 
 // AppendCard appends the 6 per-card features to a context vector, returning the full row.
@@ -522,6 +772,21 @@ func AppendCard(ctx [ContextFeatureLen]float32, c card.Card, trump card.Suit, ha
 		}
 	}
 	i++ // card_is_top_in_suit
+
+	// card_suit_remaining: remaining cards of this card's effective suit globally / 12.
+	if history != nil {
+		total := offSuitCardCount(effSuit, trump)
+		if isTrump {
+			total = card.TotalTrumpCards
+		}
+		played := history.CardsPlayedInSuit(effSuit, trump)
+		rem := total - played
+		if rem < 0 {
+			rem = 0
+		}
+		f[i] = float32(rem) / 12.0
+	}
+	i++ // card_suit_remaining
 
 	_ = i
 	return f

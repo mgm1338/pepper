@@ -23,7 +23,7 @@ func TestCollectBidHand_rowCount(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	gs := game.NewGame(0)
 	strats := balancedStrats()
-	rows := CollectBidHand(0, gs, strats, strats, rng, 5)
+	rows := CollectBidHand(0, gs, strats, strats, rng, BidCollectOpts{Rollouts: 5})
 
 	// Each hand has up to 6 bid decisions. Stuck hands produce 0 rows (dealer forced).
 	// We should get at least 1 row (some seat sees a valid bid decision).
@@ -41,7 +41,7 @@ func TestCollectBidHand_fieldRanges(t *testing.T) {
 	strats := balancedStrats()
 
 	for hand := 0; hand < 50; hand++ {
-		rows := CollectBidHand(hand, gs, strats, strats, rng, 3)
+		rows := CollectBidHand(hand, gs, strats, strats, rng, BidCollectOpts{Rollouts: 3})
 		gs.NextDealer()
 
 		for i, r := range rows {
@@ -68,7 +68,7 @@ func TestCollectBidHand_featureLen(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	gs := game.NewGame(0)
 	strats := balancedStrats()
-	rows := CollectBidHand(0, gs, strats, strats, rng, 3)
+	rows := CollectBidHand(0, gs, strats, strats, rng, BidCollectOpts{Rollouts: 3})
 	for i, r := range rows {
 		if len(r.Features) != BidTotalLen {
 			t.Errorf("row %d: Features len=%d, want %d", i, len(r.Features), BidTotalLen)
@@ -81,7 +81,7 @@ func TestCollectBidHand_deterministic(t *testing.T) {
 		rng := rand.New(rand.NewSource(123))
 		gs := game.NewGame(2)
 		strats := balancedStrats()
-		return CollectBidHand(0, gs, strats, strats, rng, 5)
+		return CollectBidHand(0, gs, strats, strats, rng, BidCollectOpts{Rollouts: 5})
 	}
 
 	a, b := run(), run()
@@ -107,7 +107,7 @@ func TestCollectHand_rowCount(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	gs := game.NewGame(0)
 	strats := balancedStrats()
-	rows := CollectHand(0, gs, strats, strats, rng, 5)
+	rows := CollectHand(0, gs, strats, strats, rng, CollectOpts{Rollouts: 5})
 
 	// Each hand produces rows per (trick × seat) decision. At least 1 row expected.
 	if len(rows) == 0 {
@@ -121,7 +121,7 @@ func TestCollectHand_fieldRanges(t *testing.T) {
 	strats := balancedStrats()
 
 	for hand := 0; hand < 30; hand++ {
-		rows := CollectHand(hand, gs, strats, strats, rng, 3)
+		rows := CollectHand(hand, gs, strats, strats, rng, CollectOpts{Rollouts: 3})
 		gs.NextDealer()
 
 		for i, r := range rows {
@@ -149,7 +149,7 @@ func TestCollectHand_deterministic(t *testing.T) {
 		rng := rand.New(rand.NewSource(456))
 		gs := game.NewGame(1)
 		strats := balancedStrats()
-		return CollectHand(0, gs, strats, strats, rng, 3)
+		return CollectHand(0, gs, strats, strats, rng, CollectOpts{Rollouts: 3})
 	}
 
 	a, b := run(), run()

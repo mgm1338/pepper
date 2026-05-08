@@ -69,11 +69,12 @@ func (r *CollectRow) ReadBinary(rd io.Reader) error {
 // including everything needed to fork and evaluate card choices counterfactually.
 type decisionPoint struct {
 	seat         int
-	hands        [6][]card.Card   // deep copy: all current hands (cards removed as tricks completed)
+	hands        [6][]card.Card    // deep copy: all current hands (cards removed as tricks completed)
 	trick        []game.PlayedCard // cards already in the current trick (before this seat plays)
 	trickNum     int
 	tricksTaken  [6]int
 	historyCards []card.Card // copy of all cards from completed tricks
+	seatVoids    [6]uint8    // void bitmasks captured at this decision point
 	leader       int
 	trump        card.Suit
 	callerSeat   int
@@ -149,6 +150,8 @@ func (dp *decisionPoint) rollout(forcedCard card.Card, rolloutStrat *[6]game.Str
 	// Get a pooled HandHistory — avoids heap escape through TrickState.History interface call.
 	history := historyPool.Get().(*game.HandHistory)
 	history.Reset()
+	history.SetTrump(dp.trump)
+	history.SetVoids(dp.seatVoids)
 	if len(dp.historyCards) > 0 {
 		history.Record(dp.historyCards)
 	}
@@ -264,6 +267,42 @@ func releaseHands(h *[6][]card.Card) {
 	handBufPool.Put(h)
 }
 
+// CollectOpts configures data-collection behaviour for CollectHand.
+type CollectOpts struct {
+	Rollouts int  // counterfactual rollouts per candidate card
+	TopK     int  // 0 = evaluate all candidates; >0 = pre-screen to top K by model score
+	Screener *MLP // model for top-K scoring; nil disables screening
+}
+
+// screenTopK scores each candidate with m and writes the top k into dst[:k].
+// len(valid) must be > k. Uses a partial selection sort (at most 8 elements).
+// dst must have cap >= k; the caller typically passes a stack-allocated [8]card.Card.
+func screenTopK(m *MLP, valid []card.Card, ctx [ContextFeatureLen]float32, trump card.Suit, hand []card.Card, trick *game.Trick, hist *game.HandHistory, k int, dst []card.Card) []card.Card {
+	type cs struct {
+		c card.Card
+		v float32
+	}
+	var buf [8]cs
+	for i, c := range valid {
+		buf[i] = cs{c, m.Score(AppendCard(ctx, c, trump, hand, trick, hist))}
+	}
+	scored := buf[:len(valid)]
+	for i := 0; i < k; i++ {
+		best := i
+		for j := i + 1; j < len(scored); j++ {
+			if scored[j].v > scored[best].v {
+				best = j
+			}
+		}
+		scored[i], scored[best] = scored[best], scored[i]
+	}
+	dst = dst[:k]
+	for i := 0; i < k; i++ {
+		dst[i] = scored[i].c
+	}
+	return dst
+}
+
 // CollectHand runs one complete hand and returns counterfactual training rows.
 func CollectHand(
 	handID int,
@@ -271,7 +310,7 @@ func CollectHand(
 	strategies [6]game.Strategy,
 	rolloutStrat [6]game.Strategy,
 	rng *rand.Rand,
-	rollouts int,
+	opts CollectOpts,
 ) []CollectRow {
 	// Deal.
 	dealBuf := dealBufPool.Get().(*card.DealBuf)
@@ -310,10 +349,11 @@ func CollectHand(
 		)
 	}
 
-	activeSeats := buildActiveSeats(isPepper, callerSeat, sittingOut)
+	activeSeats := buildActiveSeats(isPepper, sittingOut)
 	tricksTaken := [6]int{}
 	leader := callerSeat
 	var history game.HandHistory
+	history.SetTrump(trump)
 	validBufPtr := validCardBufPool.Get().(*[]card.Card)
 	validBuf := (*validBufPtr)[:0]
 	rolloutBufPtr := validCardBufPool.Get().(*[]card.Card)
@@ -325,9 +365,13 @@ func CollectHand(
 		validCardBufPool.Put(rolloutBufPtr)
 	}()
 	rows := make([]CollectRow, 0, 8*len(activeSeats)*game.TotalTricks)
+	var topKBuf [8]card.Card
+
+	trick := trickPool.Get().(*game.Trick)
+	defer trickPool.Put(trick)
 
 	for t := 0; t < game.TotalTricks; t++ {
-		trick := game.NewTrick(leader, trump)
+		trick.Reset(leader, trump)
 		leaderIdx := indexInSlice(activeSeats, leader)
 
 		for step := 0; step < len(activeSeats); step++ {
@@ -347,50 +391,59 @@ func CollectHand(
 				Hand:        hands[seat],
 			}
 
-			// Capture decision point snapshot.
-			pooledHands := copyHandsPooled(hands)
-			dp := decisionPoint{
-				seat:         seat,
-				hands:        *pooledHands,
-				trick:        copyPlayedCards(trick.Cards[:trick.NCards]),
-				trickNum:     t,
-				tricksTaken:  tricksTaken,
-				historyCards: history.PlayedSlice(),
-				leader:       leader,
-				trump:        trump,
-				callerSeat:   callerSeat,
-				bidAmount:    bidResult.Amount,
-				isPepper:     isPepper,
-				scores:       gs.Scores,
-				activeSeats:  activeSeats,
-				seatStep:     step,
-			}
-
-			ctx := ExtractContext(seat, hands[seat], state, len(activeSeats))
-
-			for _, candidate := range valid {
-				var totalDelta float64
-				madeBidCount := 0
-				rolloutBuf = rolloutBuf[:0]
-				for r := 0; r < rollouts; r++ {
-					delta, made := dp.rollout(candidate, &rolloutStrat, rng, &rolloutBuf)
-					totalDelta += float64(delta)
-					if made {
-						madeBidCount++
-					}
+			// Only collect training rows when there is an actual decision to make.
+			if len(valid) > 1 {
+				// Capture decision point snapshot.
+				pooledHands := copyHandsPooled(hands)
+				dp := decisionPoint{
+					seat:         seat,
+					hands:        *pooledHands,
+					trick:        copyPlayedCards(trick.Cards[:trick.NCards]),
+					trickNum:     t,
+					tricksTaken:  tricksTaken,
+					historyCards: history.PlayedSlice(),
+					seatVoids:    history.Voids(),
+					leader:       leader,
+					trump:        trump,
+					callerSeat:   callerSeat,
+					bidAmount:    bidResult.Amount,
+					isPepper:     isPepper,
+					scores:       gs.Scores,
+					activeSeats:  activeSeats,
+					seatStep:     step,
 				}
-				rows = append(rows, CollectRow{
-					HandID:        handID,
-					TrickNumber:   t,
-					Seat:          seat,
-					IsBiddingTeam: game.TeamOf(seat) == game.TeamOf(callerSeat),
-					Features:      AppendCard(ctx, candidate, trump, hands[seat], trick, &history),
-					ScoreDelta:    float32(totalDelta / float64(rollouts)),
-					MadeBidRate:   float32(float64(madeBidCount) / float64(rollouts)),
-				})
+
+				ctx := ExtractContext(seat, hands[seat], state, len(activeSeats))
+
+				candidates := valid
+				if opts.TopK > 0 && opts.Screener != nil && len(valid) > opts.TopK {
+					candidates = screenTopK(opts.Screener, valid, ctx, trump, hands[seat], trick, &history, opts.TopK, topKBuf[:])
+				}
+
+				for _, candidate := range candidates {
+					var totalDelta float64
+					madeBidCount := 0
+					rolloutBuf = rolloutBuf[:0]
+					for r := 0; r < opts.Rollouts; r++ {
+						delta, made := dp.rollout(candidate, &rolloutStrat, rng, &rolloutBuf)
+						totalDelta += float64(delta)
+						if made {
+							madeBidCount++
+						}
+					}
+					rows = append(rows, CollectRow{
+						HandID:        handID,
+						TrickNumber:   t,
+						Seat:          seat,
+						IsBiddingTeam: game.TeamOf(seat) == game.TeamOf(callerSeat),
+						Features:      AppendCard(ctx, candidate, trump, hands[seat], trick, &history),
+						ScoreDelta:    float32(totalDelta / float64(opts.Rollouts)),
+						MadeBidRate:   float32(float64(madeBidCount) / float64(opts.Rollouts)),
+					})
+				}
+				releasePlayedCards(dp.trick)
+				releaseHands(pooledHands)
 			}
-			releasePlayedCards(dp.trick)
-			releaseHands(pooledHands)
 
 			// Play the actual card.
 			chosen := strategies[seat].Play(seat, valid, &state)
@@ -419,15 +472,6 @@ func dropCardInPlace(hand []card.Card, target card.Card) []card.Card {
 		}
 	}
 	return hand
-}
-
-func copyHands(hands [6][]card.Card) [6][]card.Card {
-	var result [6][]card.Card
-	for i, h := range hands {
-		result[i] = make([]card.Card, len(h))
-		copy(result[i], h)
-	}
-	return result
 }
 
 func copyPlayedCards(pcs []game.PlayedCard) []game.PlayedCard {
@@ -461,7 +505,7 @@ func buildActiveSeatsBuf(pepperActive bool, sittingOut [2]int, dst []int) []int 
 	return dst
 }
 
-func buildActiveSeats(pepperActive bool, callerSeat int, sittingOut [2]int) []int {
+func buildActiveSeats(pepperActive bool, sittingOut [2]int) []int {
 	return buildActiveSeatsBuf(pepperActive, sittingOut, nil)
 }
 

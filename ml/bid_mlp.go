@@ -110,8 +110,18 @@ func (m *BidMLP) Score(features [BidTotalLen]float32) float32 {
 
 // ScoreBatch scores n candidate bid feature vectors in a single cgo call (all layers fused).
 // featFlat must be n*BidTotalLen elements (row-major: features for bid 0, then bid 1, …).
+// Normalized in-place when FeatureMean is set — callers must use BidMLP-owned buffers.
 // out must have capacity >= n.
 func (m *BidMLP) ScoreBatch(n int, featFlat []float32, out []float32) {
+	if len(m.w.FeatureMean) > 0 {
+		nf := m.nFeat
+		for i := 0; i < n; i++ {
+			row := featFlat[i*nf : (i+1)*nf]
+			for j, mean := range m.w.FeatureMean {
+				row[j] = (row[j] - mean) / (m.w.FeatureStd[j] + 1e-8)
+			}
+		}
+	}
 	H1 := len(m.h1)
 	H2 := len(m.h2)
 	H3 := 0

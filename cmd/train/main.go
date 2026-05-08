@@ -12,6 +12,7 @@ import (
 	"math/rand"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/max/pepper/ml"
@@ -40,18 +41,34 @@ func main() {
 	lrSchedule  := flag.String("lr-schedule", "plateau", "LR schedule: plateau or cosine")
 	cosineT0    := flag.Int("cosine-t0", 50, "Cosine annealing initial cycle length (epochs)")
 	cosineTMult := flag.Float64("cosine-tmult", 2.0, "Cosine annealing cycle length multiplier per restart")
+	replayData   := flag.String("replay-data", "", "comma-separated extra data files for experience replay")
+	shuffleBuf   := flag.Int("shuffle-buf", 0, "Shuffle buffer size for streaming training (0=disabled, recommend 65536)")
+	huberDelta   := flag.Float64("huber-delta", 0, "Huber loss delta (0=MSE)")
+	replayWeight := flag.Float64("replay-weight", 0.5, "Loss weight for replay-data rows (0=ignore, 1=full weight)")
+	normFeatures := flag.Bool("norm-features", false, "Compute and apply per-feature input normalization")
 	flag.Parse()
 
 	rng := rand.New(rand.NewSource(*seed))
 
+	dataPaths := []string{*dataPath}
+	if *replayData != "" {
+		for _, p := range strings.Split(*replayData, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				dataPaths = append(dataPaths, p)
+			}
+		}
+	}
+
 	if *format == "bin" && *mode == "bid" {
-		runBidBinaryStreaming(rng, *dataPath, *outPath, *warmStart, *warmHiddenOnly, *lrSchedule, *cosineT0, *cosineTMult, *h1, *h2, *h3,
+		runBidBinaryStreaming(rng, dataPaths, *outPath, *warmStart, *warmHiddenOnly, *lrSchedule, *cosineT0, *cosineTMult, *h1, *h2, *h3,
 			*batch, *epochs, *patience, *valFrac,
-			float32(*lr), float32(*wd), float32(*minLR), float32(*minDelta))
+			float32(*lr), float32(*wd), float32(*minLR), float32(*minDelta),
+			*shuffleBuf, float32(*huberDelta), float32(*replayWeight), *normFeatures)
 	} else if *format == "bin" {
-		runBinaryStreaming(rng, *dataPath, *outPath, *warmStart, *target, *lrSchedule, *cosineT0, *cosineTMult, *h1, *h2, *h3,
+		runBinaryStreaming(rng, dataPaths, *outPath, *warmStart, *target, *lrSchedule, *cosineT0, *cosineTMult, *h1, *h2, *h3,
 			*batch, *epochs, *patience, *valFrac,
-			float32(*lr), float32(*wd), float32(*minLR), float32(*minDelta))
+			float32(*lr), float32(*wd), float32(*minLR), float32(*minDelta),
+			*shuffleBuf, float32(*huberDelta), float32(*replayWeight), *normFeatures)
 	} else {
 		runCSV(rng, *dataPath, *outPath, *target, *h1, *h2, *h3,
 			*batch, *epochs, *patience, *valFrac,
@@ -60,20 +77,23 @@ func main() {
 }
 
 // runBinaryStreaming handles binary format with streaming (no full data in memory).
-// Pass 1: compute stats. Each epoch: re-read file, stream batches.
-func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath, target, lrSchedule string, cosineT0 int, cosineTMult float64,
+// Pass 1: compute stats. Each epoch: re-read each file, stream batches.
+func runBinaryStreaming(rng *rand.Rand, dataPaths []string, outPath, warmStartPath, target, lrSchedule string, cosineT0 int, cosineTMult float64,
 	h1, h2, h3, batch, epochs, patience int, valFrac float64,
-	lr, wd, minLR, minDelta float32) {
+	lr, wd, minLR, minDelta float32,
+	shuffleBufSize int, huberDelta, replayWeight float32, normFeatures bool) {
 
 	nFeat := ml.TotalFeatureLen
-	fmt.Printf("Loading %s (format=bin, streaming) ...\n", dataPath)
+	fmt.Printf("Loading %v (format=bin, streaming) ...\n", dataPaths)
 	t0 := time.Now()
 
-	// --- Pass 1: count rows and compute target stats ---
+	// --- Pass 1: count rows, compute target stats, compute per-feature stats ---
 	var nRows int64
 	var tSum, tSum2 float64
-	{
-		f, err := os.Open(dataPath)
+	featSum  := make([]float64, nFeat)
+	featSum2 := make([]float64, nFeat)
+	for _, path := range dataPaths {
+		f, err := os.Open(path)
 		if err != nil { log.Fatal(err) }
 		rd := bufio.NewReaderSize(f, 1<<20)
 		var row ml.CollectRow
@@ -89,9 +109,23 @@ func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath, target
 			}
 			tSum += float64(tv)
 			tSum2 += float64(tv) * float64(tv)
+			for j, fv := range row.Features {
+				featSum[j]  += float64(fv)
+				featSum2[j] += float64(fv) * float64(fv)
+			}
 			nRows++
 		}
 		f.Close()
+	}
+
+	featMean := make([]float32, nFeat)
+	featStd  := make([]float32, nFeat)
+	for j := 0; j < nFeat; j++ {
+		m := featSum[j] / float64(nRows)
+		v := featSum2[j]/float64(nRows) - m*m
+		if v < 0 { v = 0 }
+		featMean[j] = float32(m)
+		featStd[j]  = float32(math.Sqrt(v))
 	}
 
 	yMeanF64 := tSum / float64(nRows)
@@ -112,6 +146,11 @@ func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath, target
 	trainer.ResizeBatch(batch)
 	trainer.W.YMean = yMean
 	trainer.W.YStd = yStd
+	trainer.HuberDelta = huberDelta
+	if normFeatures {
+		trainer.W.FeatureMean = featMean
+		trainer.W.FeatureStd  = featStd
+	}
 
 	if warmStartPath != "" {
 		w, err := ml.LoadMLP(warmStartPath)
@@ -143,16 +182,31 @@ func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath, target
 		nParams += h2 + 1
 	}
 	fmt.Printf(" → 1  (%d params)\n", nParams)
+	extra := ""
+	if shuffleBufSize > 0 { extra += fmt.Sprintf("  shuffle-buf=%d", shuffleBufSize) }
+	if huberDelta > 0     { extra += fmt.Sprintf("  huber=%.2f", huberDelta) }
+	if normFeatures       { extra += "  norm-features" }
 	if cosineMode {
-		fmt.Printf("Config: lr=%.3f  wd=%.4f  batch=%d  max_epochs=%d  schedule=cosine(T0=%d,Tmult=%.0f)\n\n",
-			currentLR, wd, batch, epochs, cosineT0, cosineTMult)
+		fmt.Printf("Config: lr=%.3f  wd=%.4f  batch=%d  max_epochs=%d  schedule=cosine(T0=%d,Tmult=%.0f)%s\n\n",
+			currentLR, wd, batch, epochs, cosineT0, cosineTMult, extra)
 	} else {
-		fmt.Printf("Config: lr=%.3f  wd=%.4f  batch=%d  max_epochs=%d  patience=%d\n\n",
-			currentLR, wd, batch, epochs, patience)
+		fmt.Printf("Config: lr=%.3f  wd=%.4f  batch=%d  max_epochs=%d  patience=%d%s\n\n",
+			currentLR, wd, batch, epochs, patience, extra)
 	}
 
 	fmt.Printf("%6s  %10s  %10s  %10s  %8s  %6s\n", "Epoch", "Train MSE", "Val MSE", "Val RMSE", "LR", "Time")
 	fmt.Println("--------------------------------------------------------------")
+
+	// Shuffle buffer for training rows (reused across epochs, avoids per-epoch alloc).
+	type cardEntry struct {
+		features [ml.TotalFeatureLen]float32
+		tv       float32 // raw target before y-normalization
+		weight   float32 // 1.0 for current iter, replayWeight for replay
+	}
+	var shufBuf []cardEntry
+	if shuffleBufSize > 0 {
+		shufBuf = make([]cardEntry, shuffleBufSize)
+	}
 
 	// --- Training loop: stream each epoch ---
 	for epoch := 1; epoch <= epochs; epoch++ {
@@ -164,16 +218,13 @@ func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath, target
 			currentLR = float32(float64(minLR) + 0.5*(float64(lr)-float64(minLR))*(1+math.Cos(math.Pi*ratio)))
 		}
 
-		f, err := os.Open(dataPath)
-		if err != nil { log.Fatal(err) }
-		rd := bufio.NewReaderSize(f, 1<<20)
-
 		var trainLoss float32
 		var trainN int64
 		var valLoss float32
 		var valN int64
 		batchCount := 0
-		rowIdx := int64(0)
+		readIdx := int64(0)
+		inTrain := true
 
 		processBatch := func(n int, isTrain bool) {
 			trainer.ForwardBatch(n, preds[:n])
@@ -195,46 +246,77 @@ func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath, target
 			}
 		}
 
-		var row ml.CollectRow
-		inTrain := true
-		for {
-			err := row.ReadBinary(rd)
-			if err == io.EOF { break }
-			if err != nil { log.Fatal(err) }
-
-			var tv float32
-			if target == "made_bid_rate" {
-				tv = row.MadeBidRate
-			} else {
-				tv = row.ScoreDelta
-			}
-			normTV := (tv - yMean) / (yStd + 1e-8)
-
-			// Flush training batch at train/val boundary
-			if inTrain && rowIdx >= nTrain {
-				if batchCount > 0 {
-					processBatch(batchCount, true)
-					batchCount = 0
-				}
-				inTrain = false
-			}
-
+		emit := func(features *[ml.TotalFeatureLen]float32, normTV, weight float32) {
 			dstOff := batchCount * nFeat
-			copy(trainer.BatchX[dstOff:dstOff+nFeat], row.Features[:])
+			if normFeatures {
+				for j, f := range features {
+					trainer.BatchX[dstOff+j] = (f - featMean[j]) / (featStd[j] + 1e-8)
+				}
+			} else {
+				copy(trainer.BatchX[dstOff:dstOff+nFeat], (*features)[:])
+			}
 			trainer.BatchY[batchCount] = normTV
+			trainer.BatchW[batchCount] = weight
 			batchCount++
-			rowIdx++
-
 			if batchCount >= batch {
 				processBatch(batchCount, inTrain)
 				batchCount = 0
 			}
 		}
-		// Flush remaining
-		if batchCount > 0 {
-			processBatch(batchCount, inTrain)
+
+		shufN := 0
+		flushShuf := func() {
+			for i := shufN - 1; i > 0; i-- {
+				j := rng.Intn(i + 1)
+				shufBuf[i], shufBuf[j] = shufBuf[j], shufBuf[i]
+			}
+			for i := 0; i < shufN; i++ {
+				normTV := (shufBuf[i].tv - yMean) / (yStd + 1e-8)
+				emit(&shufBuf[i].features, normTV, shufBuf[i].weight)
+			}
+			shufN = 0
 		}
-		f.Close()
+
+		for fileIdx, path := range dataPaths {
+			rowWeight := float32(1.0)
+			if fileIdx > 0 { rowWeight = replayWeight }
+
+			f, err := os.Open(path)
+			if err != nil { log.Fatal(err) }
+			rd := bufio.NewReaderSize(f, 1<<20)
+			var row ml.CollectRow
+			for {
+				err := row.ReadBinary(rd)
+				if err == io.EOF { break }
+				if err != nil { log.Fatal(err) }
+
+				// Transition: flush any buffered training rows before switching to val.
+				if inTrain && readIdx >= nTrain {
+					if shufN > 0 { flushShuf() }
+					if batchCount > 0 { processBatch(batchCount, true); batchCount = 0 }
+					inTrain = false
+				}
+
+				var tv float32
+				if target == "made_bid_rate" { tv = row.MadeBidRate } else { tv = row.ScoreDelta }
+
+				if inTrain && shuffleBufSize > 0 {
+					shufBuf[shufN].features = row.Features
+					shufBuf[shufN].tv       = tv
+					shufBuf[shufN].weight   = rowWeight
+					shufN++
+					if shufN == shuffleBufSize { flushShuf() }
+				} else {
+					normTV := (tv - yMean) / (yStd + 1e-8)
+					emit(&row.Features, normTV, rowWeight)
+				}
+				readIdx++
+			}
+			f.Close()
+		}
+		// Flush remaining training rows then any partial val batch.
+		if shufN > 0 { flushShuf() }
+		if batchCount > 0 { processBatch(batchCount, inTrain) }
 
 		trainMSE := trainLoss / float32(trainN)
 		valMSE := valLoss / float32(valN)
@@ -288,19 +370,22 @@ func runBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath, target
 }
 
 // runBidBinaryStreaming handles binary format for bid training data (BidCollectRow).
-func runBidBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath string, warmHiddenOnly bool, lrSchedule string, cosineT0 int, cosineTMult float64,
+func runBidBinaryStreaming(rng *rand.Rand, dataPaths []string, outPath, warmStartPath string, warmHiddenOnly bool, lrSchedule string, cosineT0 int, cosineTMult float64,
 	h1, h2, h3, batch, epochs, patience int, valFrac float64,
-	lr, wd, minLR, minDelta float32) {
+	lr, wd, minLR, minDelta float32,
+	shuffleBufSize int, huberDelta, replayWeight float32, normFeatures bool) {
 
 	nFeat := ml.BidTotalLen
-	fmt.Printf("Loading %s (format=bin, mode=bid, streaming) ...\n", dataPath)
+	fmt.Printf("Loading %v (format=bin, mode=bid, streaming) ...\n", dataPaths)
 	t0 := time.Now()
 
-	// --- Pass 1: count rows and compute target stats ---
+	// --- Pass 1: count rows, compute target stats, compute per-feature stats ---
 	var nRows int64
 	var tSum, tSum2 float64
-	{
-		f, err := os.Open(dataPath)
+	featSum  := make([]float64, nFeat)
+	featSum2 := make([]float64, nFeat)
+	for _, path := range dataPaths {
+		f, err := os.Open(path)
 		if err != nil { log.Fatal(err) }
 		rd := bufio.NewReaderSize(f, 1<<20)
 		var row ml.BidCollectRow
@@ -310,9 +395,23 @@ func runBidBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath stri
 			if err != nil { log.Fatal(err) }
 			tSum += float64(row.ScoreDelta)
 			tSum2 += float64(row.ScoreDelta) * float64(row.ScoreDelta)
+			for j, fv := range row.Features {
+				featSum[j]  += float64(fv)
+				featSum2[j] += float64(fv) * float64(fv)
+			}
 			nRows++
 		}
 		f.Close()
+	}
+
+	featMean := make([]float32, nFeat)
+	featStd  := make([]float32, nFeat)
+	for j := 0; j < nFeat; j++ {
+		m := featSum[j] / float64(nRows)
+		v := featSum2[j]/float64(nRows) - m*m
+		if v < 0 { v = 0 }
+		featMean[j] = float32(m)
+		featStd[j]  = float32(math.Sqrt(v))
 	}
 
 	yMeanF64 := tSum / float64(nRows)
@@ -320,19 +419,21 @@ func runBidBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath stri
 	yMean := float32(yMeanF64)
 	yStd := float32(yStdF64)
 
-	nVal := int64(float64(nRows) * valFrac)
-	nTrain := nRows - nVal
-
 	fmt.Printf("  %12d rows total (%v)\n", nRows, time.Since(t0).Round(time.Millisecond))
 	fmt.Printf("  %d features  target=score_delta\n", nFeat)
 	fmt.Printf("  mean=%.4f  std=%.4f\n", yMean, yStd)
-	fmt.Printf("  train=%10d  val=%10d\n\n", nTrain, nVal)
+	fmt.Printf("  rows=%10d\n\n", nRows)
 
 	// --- Setup trainer ---
 	trainer := ml.NewMLPTrainer(nFeat, h1, h2, h3, rng)
 	trainer.ResizeBatch(batch)
 	trainer.W.YMean = yMean
 	trainer.W.YStd = yStd
+	trainer.HuberDelta = huberDelta
+	if normFeatures {
+		trainer.W.FeatureMean = featMean
+		trainer.W.FeatureStd  = featStd
+	}
 
 	if warmStartPath != "" {
 		w, err := ml.LoadBidMLP(warmStartPath)
@@ -369,16 +470,41 @@ func runBidBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath stri
 		nParams += h2 + 1
 	}
 	fmt.Printf(" → 1  (%d params)\n", nParams)
+	extra := ""
+	if shuffleBufSize > 0 { extra += fmt.Sprintf("  shuffle-buf=%d", shuffleBufSize) }
+	if huberDelta > 0     { extra += fmt.Sprintf("  huber=%.2f", huberDelta) }
+	if normFeatures       { extra += "  norm-features" }
 	if cosineMode {
-		fmt.Printf("Config: lr=%.3f  wd=%.4f  batch=%d  max_epochs=%d  schedule=cosine(T0=%d,Tmult=%.0f)\n\n",
-			currentLR, wd, batch, epochs, cosineT0, cosineTMult)
+		fmt.Printf("Config: lr=%.3f  wd=%.4f  batch=%d  max_epochs=%d  schedule=cosine(T0=%d,Tmult=%.0f)%s\n\n",
+			currentLR, wd, batch, epochs, cosineT0, cosineTMult, extra)
 	} else {
-		fmt.Printf("Config: lr=%.3f  wd=%.4f  batch=%d  max_epochs=%d  patience=%d\n\n",
-			currentLR, wd, batch, epochs, patience)
+		fmt.Printf("Config: lr=%.3f  wd=%.4f  batch=%d  max_epochs=%d  patience=%d%s\n\n",
+			currentLR, wd, batch, epochs, patience, extra)
 	}
 
 	fmt.Printf("%6s  %10s  %10s  %10s  %8s  %6s\n", "Epoch", "Train MSE", "Val MSE", "Val RMSE", "LR", "Time")
 	fmt.Println("--------------------------------------------------------------")
+
+	// Separate train/val staging buffers (reused across epochs).
+	trainBatchX := make([]float32, batch*nFeat)
+	valBatchX   := make([]float32, batch*nFeat)
+	trainBatchY := make([]float32, batch)
+	valBatchY   := make([]float32, batch)
+	trainBatchW := make([]float32, batch)
+	valBatchW   := make([]float32, batch)
+	for i := range trainBatchW { trainBatchW[i] = 1.0 }
+	for i := range valBatchW   { valBatchW[i]   = 1.0 }
+
+	// Shuffle buffer (all rows — bid uses modulo val split, not positional).
+	type bidEntry struct {
+		features [ml.BidTotalLen]float32
+		tv       float32 // raw score delta before y-normalization
+		weight   float32
+	}
+	var shufBuf []bidEntry
+	if shuffleBufSize > 0 {
+		shufBuf = make([]bidEntry, shuffleBufSize)
+	}
 
 	// --- Training loop: stream each epoch ---
 	for epoch := 1; epoch <= epochs; epoch++ {
@@ -390,15 +516,11 @@ func runBidBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath stri
 			currentLR = float32(float64(minLR) + 0.5*(float64(lr)-float64(minLR))*(1+math.Cos(math.Pi*ratio)))
 		}
 
-		f, err := os.Open(dataPath)
-		if err != nil { log.Fatal(err) }
-		rd := bufio.NewReaderSize(f, 1<<20)
-
 		var trainLoss float32
 		var trainN int64
 		var valLoss float32
 		var valN int64
-		rowIdx := int64(0)
+		rowIdx := int64(0) // emitted row counter (determines val split)
 
 		processBatch := func(n int, isTrain bool) {
 			trainer.ForwardBatch(n, preds[:n])
@@ -420,16 +542,12 @@ func runBidBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath stri
 			}
 		}
 
-		var row ml.BidCollectRow
 		var trainBatch, valBatch int
-		trainBatchX := make([]float32, batch*nFeat)
-		valBatchX   := make([]float32, batch*nFeat)
-		trainBatchY := make([]float32, batch)
-		valBatchY   := make([]float32, batch)
 		flushTrain := func() {
 			if trainBatch > 0 {
 				copy(trainer.BatchX, trainBatchX[:trainBatch*nFeat])
 				copy(trainer.BatchY, trainBatchY[:trainBatch])
+				copy(trainer.BatchW, trainBatchW[:trainBatch])
 				processBatch(trainBatch, true)
 				trainBatch = 0
 			}
@@ -442,32 +560,81 @@ func runBidBinaryStreaming(rng *rand.Rand, dataPath, outPath, warmStartPath stri
 				valBatch = 0
 			}
 		}
-		for {
-			err := row.ReadBinary(rd)
-			if err == io.EOF { break }
-			if err != nil { log.Fatal(err) }
 
-			normTV := (row.ScoreDelta - yMean) / (yStd + 1e-8)
-			isVal := rowIdx % 10 == 0
-
+		// emitBidRow assigns a row to train or val based on emitted rowIdx.
+		emitBidRow := func(features *[ml.BidTotalLen]float32, normTV, weight float32) {
+			isVal := rowIdx%10 == 0
+			rowIdx++
 			if isVal {
 				dstOff := valBatch * nFeat
-				copy(valBatchX[dstOff:dstOff+nFeat], row.Features[:])
+				if normFeatures {
+					for j, f := range features {
+						valBatchX[dstOff+j] = (f - featMean[j]) / (featStd[j] + 1e-8)
+					}
+				} else {
+					copy(valBatchX[dstOff:dstOff+nFeat], (*features)[:])
+				}
 				valBatchY[valBatch] = normTV
 				valBatch++
 				if valBatch >= batch { flushVal() }
 			} else {
 				dstOff := trainBatch * nFeat
-				copy(trainBatchX[dstOff:dstOff+nFeat], row.Features[:])
+				if normFeatures {
+					for j, f := range features {
+						trainBatchX[dstOff+j] = (f - featMean[j]) / (featStd[j] + 1e-8)
+					}
+				} else {
+					copy(trainBatchX[dstOff:dstOff+nFeat], (*features)[:])
+				}
 				trainBatchY[trainBatch] = normTV
+				trainBatchW[trainBatch] = weight
 				trainBatch++
 				if trainBatch >= batch { flushTrain() }
 			}
-			rowIdx++
 		}
+
+		shufN := 0
+		flushShuf := func() {
+			for i := shufN - 1; i > 0; i-- {
+				j := rng.Intn(i + 1)
+				shufBuf[i], shufBuf[j] = shufBuf[j], shufBuf[i]
+			}
+			for i := 0; i < shufN; i++ {
+				normTV := (shufBuf[i].tv - yMean) / (yStd + 1e-8)
+				emitBidRow(&shufBuf[i].features, normTV, shufBuf[i].weight)
+			}
+			shufN = 0
+		}
+
+		for fileIdx, path := range dataPaths {
+			rowWeight := float32(1.0)
+			if fileIdx > 0 { rowWeight = replayWeight }
+
+			f, err := os.Open(path)
+			if err != nil { log.Fatal(err) }
+			rd := bufio.NewReaderSize(f, 1<<20)
+			var row ml.BidCollectRow
+			for {
+				err := row.ReadBinary(rd)
+				if err == io.EOF { break }
+				if err != nil { log.Fatal(err) }
+
+				if shuffleBufSize > 0 {
+					shufBuf[shufN].features = row.Features
+					shufBuf[shufN].tv       = row.ScoreDelta
+					shufBuf[shufN].weight   = rowWeight
+					shufN++
+					if shufN == shuffleBufSize { flushShuf() }
+				} else {
+					normTV := (row.ScoreDelta - yMean) / (yStd + 1e-8)
+					emitBidRow(&row.Features, normTV, rowWeight)
+				}
+			}
+			f.Close()
+		}
+		if shufN > 0 { flushShuf() }
 		flushTrain()
 		flushVal()
-		f.Close()
 
 		trainMSE := trainLoss / float32(trainN)
 		valMSE := valLoss / float32(valN)

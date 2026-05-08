@@ -33,7 +33,7 @@ func TestPipeline_BidCollectTrainScore(t *testing.T) {
 
 	var allRows []BidCollectRow
 	for i := 0; i < nHands; i++ {
-		rows := CollectBidHand(i, gs, strats, strats, rng, rollouts)
+		rows := CollectBidHand(i, gs, strats, strats, rng, BidCollectOpts{Rollouts: rollouts})
 		allRows = append(allRows, rows...)
 		ReleaseBidRows(rows)
 		gs.NextDealer()

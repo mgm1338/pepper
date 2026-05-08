@@ -37,7 +37,7 @@ func BenchmarkCollectHandMLP(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = ml.CollectHand(i, gs, strats, rolloutStrats, rng, 1)
+		_ = ml.CollectHand(i, gs, strats, rolloutStrats, rng, ml.CollectOpts{Rollouts: 1})
 		gs.NextDealer()
 	}
 }

@@ -21,7 +21,7 @@ func BenchmarkCollectHand(b *testing.B) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = CollectHand(i, gs, strats, rollouts, rng, 20)
+		_ = CollectHand(i, gs, strats, rollouts, rng, CollectOpts{Rollouts: 20})
 		gs.NextDealer()
 	}
 }
@@ -39,7 +39,7 @@ func BenchmarkCollectBidHand(b *testing.B) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = CollectBidHand(i, gs, strats, rollouts, rng, 20)
+		_ = CollectBidHand(i, gs, strats, rollouts, rng, BidCollectOpts{Rollouts: 20})
 		gs.NextDealer()
 	}
 }
@@ -112,7 +112,12 @@ func BenchmarkCopyHandsAlloc(b *testing.B) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = copyHands(src)
+		var result [6][]card.Card
+		for j, h := range src {
+			result[j] = make([]card.Card, len(h))
+			copy(result[j], h)
+		}
+		_ = result
 	}
 }
 

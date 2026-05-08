@@ -10,9 +10,9 @@ import (
 //   32–53 extended context features (hand texture, suit breakdown, opponent signals)
 //   54–59 per-bid action features
 const (
-	BidContextLen = 54
+	BidContextLen = 68
 	BidActionLen  = 6
-	BidTotalLen   = BidContextLen + BidActionLen // 60
+	BidTotalLen   = BidContextLen + BidActionLen // 74
 
 	// bidCtxGTIdx is the index of guaranteed_tricks in the context vector.
 	// AppendBidAction reads this to compute bid-relative stretch features.
@@ -99,7 +99,31 @@ var BidFeatureNames = [BidTotalLen]string{
 	"suits_with_3plus",       // suits with 3+ trumps / 4
 	"trump_concentration",    // best_count / (best_count + second_count + 1)
 
-	// Per-bid features (54–59)
+	// Specific best-suit trump holdings (54–58)
+	"best_has_ace",   // 1 if best suit has ace (non-bower)
+	"best_has_king",  // 1 if best suit has king
+	"best_has_queen", // 1 if best suit has queen
+	"best_has_ten",   // 1 if best suit has ten
+	"best_has_nine",  // 1 if best suit has nine
+
+	// Specific second-suit trump holdings (59–61)
+	"second_has_ace",   // 1 if second suit has ace (non-bower)
+	"second_has_king",  // 1 if second suit has king
+	"second_has_queen", // 1 if second suit has queen
+
+	// Team strength estimate (62)
+	"expected_team_tricks", // (guaranteed_tricks_norm + partner_bid_level_norm) capped at 1.0
+
+	// Hand balance and risk (63–65)
+	"hand_is_balanced",        // 1 if best_count <= 4 and (best-second) <= 2
+	"opp_bid_threatens_pepper",// 1 if highest opponent bid >= 6
+	"can_make_4_solo",         // 1 if guaranteed_tricks >= 0.5 (4 of 8 tricks solo)
+
+	// Forced-bid and void signals (66–67)
+	"about_to_be_stuck", // 1 if dealer AND currentHigh==0 AND seatsLeft==0 (must bid)
+	"void_efficiency",   // 1 if void in partner suit of best trump (extra ruffing advantage)
+
+	// Per-bid features (68–73)
 	"bid_level_norm",         // bid / 8
 	"bid_is_pass",            // 1 if this is a pass
 	"bid_is_pepper",          // 1 if this is a pepper call
@@ -121,6 +145,11 @@ func BidContext(seat int, hand []card.Card, dealer int, currentHigh int, highSea
 		hasLeft   bool
 		bestRank  int
 		highCount int
+		hasAce    bool
+		hasKing   bool
+		hasQueen  bool
+		hasTen    bool
+		hasNine   bool
 	}
 
 	var suits [4]suitInfo
@@ -141,6 +170,19 @@ func BidContext(seat int, hand []card.Card, dealer int, currentHigh int, highSea
 					suits[s].hasRight = true
 				} else if card.IsLeftBower(c, card.Suit(s)) {
 					suits[s].hasLeft = true
+				} else {
+					switch tr {
+					case card.TrumpRankAce:
+						suits[s].hasAce = true
+					case card.TrumpRankKing:
+						suits[s].hasKing = true
+					case card.TrumpRankQueen:
+						suits[s].hasQueen = true
+					case card.TrumpRankTen:
+						suits[s].hasTen = true
+					case card.TrumpRankNine:
+						suits[s].hasNine = true
+					}
 				}
 				if tr >= card.TrumpRankKing {
 					suits[s].highCount++
@@ -452,7 +494,52 @@ func BidContext(seat int, hand []card.Card, dealer int, currentHigh int, highSea
 	f[i] = float32(best.count) / denom
 	i++ // trump_concentration
 
-	_ = i // i == BidContextLen here
+	// --- Specific best-suit trump holdings (54–58) ---
+	if best.hasAce   { f[i] = 1.0 }; i++ // best_has_ace
+	if best.hasKing  { f[i] = 1.0 }; i++ // best_has_king
+	if best.hasQueen { f[i] = 1.0 }; i++ // best_has_queen
+	if best.hasTen   { f[i] = 1.0 }; i++ // best_has_ten
+	if best.hasNine  { f[i] = 1.0 }; i++ // best_has_nine
+
+	// --- Specific second-suit trump holdings (59–61) ---
+	if second.hasAce   { f[i] = 1.0 }; i++ // second_has_ace
+	if second.hasKing  { f[i] = 1.0 }; i++ // second_has_king
+	if second.hasQueen { f[i] = 1.0 }; i++ // second_has_queen
+
+	// --- Team strength estimate (62) ---
+	teamTricks := f[bidCtxGTIdx] + float32(partnerBidLevel)/float32(game.TotalTricks)
+	if teamTricks > 1.0 { teamTricks = 1.0 }
+	f[i] = teamTricks
+	i++ // expected_team_tricks
+
+	// --- Hand balance and risk (63–65) ---
+	if best.count <= 4 && (best.count-second.count) <= 2 {
+		f[i] = 1.0
+	}
+	i++ // hand_is_balanced
+
+	if opp1Bid >= 6 {
+		f[i] = 1.0
+	}
+	i++ // opp_bid_threatens_pepper
+
+	if f[bidCtxGTIdx] >= 0.5 {
+		f[i] = 1.0
+	}
+	i++ // can_make_4_solo
+
+	// --- Forced-bid and void signals (66–67) ---
+	if seat == dealer && currentHigh == 0 && seatsLeft == 0 {
+		f[i] = 1.0
+	}
+	i++ // about_to_be_stuck
+
+	if rawSuitCount[card.PartnerSuit(best.suit)] == 0 {
+		f[i] = 1.0
+	}
+	i++ // void_efficiency
+
+	_ = i // i == BidContextLen (68) here
 	return f
 }
 

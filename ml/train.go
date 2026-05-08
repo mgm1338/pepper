@@ -63,6 +63,9 @@ type MLPTrainer struct {
 	BatchD2 []float32
 	BatchD3 []float32
 	BatchY  []float32 // targets [BatchSize]
+	BatchW  []float32 // per-sample loss weights [BatchSize]; 1.0 = full weight
+
+	HuberDelta float32 // Huber loss delta (0 = MSE)
 
 	T   int64   // Adam step counter
 	BC1 float32 // running beta1^T for Adam bias correction
@@ -151,6 +154,8 @@ func (t *MLPTrainer) ResizeBatch(n int) {
 	t.BatchD1 = make([]float32, n*t.W.Hidden1)
 	t.BatchD2 = make([]float32, n*t.W.Hidden2)
 	t.BatchY = make([]float32, n)
+	t.BatchW = make([]float32, n)
+	for i := range t.BatchW { t.BatchW[i] = 1.0 }
 }
 
 // ForwardBatch processes n samples at once using optimized GEMM and threading.
@@ -249,17 +254,34 @@ func (t *MLPTrainer) ForwardBatch(n int, results []float32) {
 	}
 }
 
+// outputGrad returns the output-layer gradient for one sample, applying Huber clipping
+// and the per-sample weight from BatchW.
+func (t *MLPTrainer) outputGrad(i int, pred, target float32) float32 {
+	e := pred - target
+	var g float32
+	if t.HuberDelta > 0 {
+		if e > t.HuberDelta {
+			g = t.HuberDelta
+		} else if e < -t.HuberDelta {
+			g = -t.HuberDelta
+		} else {
+			g = e
+		}
+	} else {
+		g = e
+	}
+	if i < len(t.BatchW) {
+		g *= t.BatchW[i]
+	}
+	return g
+}
+
 // BackwardBatch computes gradients for n samples using block GEMM.
+// Uses BatchW for per-sample loss weighting and HuberDelta for Huber loss (0 = MSE).
 func (t *MLPTrainer) BackwardBatch(n int, preds []float32, targets []float32) {
-	// 1. Output error
-	// For 2-layer: output is results = BatchH2 @ F3 + B3
-	// dLoss/dPred = preds - targets (for MSE)
-	// dLoss/dF3 = (preds - targets)^T @ BatchH2  -> [1 x BatchSize] @ [BatchSize x Hidden2] = [1 x Hidden2]
-	// dLoss/dBatchH2 = (preds - targets) @ F3^T  -> [BatchSize x 1] @ [1 x Hidden2] = [BatchSize x Hidden2]
-	
 	if t.W.Hidden3 > 0 {
 		// 3-layer path
-		for i := 0; i < n; i++ { t.BatchD3[i] = preds[i] - targets[i] }
+		for i := 0; i < n; i++ { t.BatchD3[i] = t.outputGrad(i, preds[i], targets[i]) }
 		// G_F4 = BatchD3^T @ BatchH3
 		for i := 0; i < n; i++ {
 			grad := t.BatchD3[i]
@@ -294,9 +316,8 @@ func (t *MLPTrainer) BackwardBatch(n int, preds []float32, targets []float32) {
 		}
 	} else {
 		// 2-layer path
-		// Compute output error deltas in BatchD2
 		for i := 0; i < n; i++ {
-			grad := preds[i] - targets[i]
+			grad := t.outputGrad(i, preds[i], targets[i])
 			t.G_B3[0] += grad
 			// Accumulate G_F3: [1 x Hidden2] = [1 x n] @ [n x Hidden2]
 			row := t.BatchH2[i*t.W.Hidden2 : (i+1)*t.W.Hidden2]

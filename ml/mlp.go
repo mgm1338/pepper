@@ -21,8 +21,10 @@ type MLPWeights struct {
 	B3H      []float32   `json:"b3h"` // [H3]
 	W4       []float32   `json:"w4"`  // [H3] output weights (3-layer only)
 	B4       float32     `json:"b4"`  // output bias (3-layer only)
-	YMean    float32     `json:"y_mean"` // target mean used during normalization
-	YStd     float32     `json:"y_std"`  // target std used during normalization
+	YMean      float32   `json:"y_mean"`             // target mean used during normalization
+	YStd       float32   `json:"y_std"`              // target std used during normalization
+	FeatureMean []float32 `json:"feat_mean,omitempty"` // per-feature input mean (nil = no normalization)
+	FeatureStd  []float32 `json:"feat_std,omitempty"`  // per-feature input std
 	NFeatures int        `json:"n_features"`
 	Hidden1  int         `json:"hidden1"`
 	Hidden2  int         `json:"hidden2"`
@@ -139,9 +141,19 @@ func (m *MLP) Clone() *MLP {
 }
 
 // ScoreBatch scores n card feature vectors in a single cgo call (all layers fused).
-// featFlat must be n*TotalFeatureLen elements (row-major).
+// featFlat must be n*TotalFeatureLen elements (row-major). Normalized in-place when
+// FeatureMean is set — callers must use MLP-owned buffers (BatchFeatBuf / featBuf).
 // out must have capacity >= n.
 func (m *MLP) ScoreBatch(n int, featFlat []float32, out []float32) {
+	if len(m.w.FeatureMean) > 0 {
+		nf := m.nFeat
+		for i := 0; i < n; i++ {
+			row := featFlat[i*nf : (i+1)*nf]
+			for j, mean := range m.w.FeatureMean {
+				row[j] = (row[j] - mean) / (m.w.FeatureStd[j] + 1e-8)
+			}
+		}
+	}
 	H1 := len(m.h1)
 	H2 := len(m.h2)
 	H3 := 0

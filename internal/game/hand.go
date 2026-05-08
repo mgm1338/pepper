@@ -127,6 +127,7 @@ func playHandFrom(gs *GameState, strategies [6]Strategy, rng *rand.Rand, log Log
 	leader := callerSeat
 	cumulativeTrumpPlayed := 0
 	var history HandHistory
+	history.SetTrump(trump)
 
 	for t := 0; t < TotalTricks; t++ {
 		trick := NewTrick(leader, trump)

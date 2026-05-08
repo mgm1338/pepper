@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"os/signal"
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/max/pepper/internal/card"
 	"github.com/max/pepper/internal/game"
@@ -20,6 +22,7 @@ import (
 
 func main() {
 	n         := flag.Int("n", 10000, "number of hands to collect")
+	floor     := flag.Int("floor", 0, "minimum hands before SIGTERM stops collection (0=stop immediately on signal)")
 	rollouts  := flag.Int("rollouts", 10, "counterfactual rollouts per candidate card")
 	workers   := flag.Int("workers", 6, "parallel workers")
 	seed         := flag.Int64("seed", 42, "random seed")
@@ -29,7 +32,16 @@ func main() {
 	bidModelPath := flag.String("bid-model", "", "path to bid_model_weights.json; use bid MLP for bidding")
 	epsilon         := flag.Float64("epsilon", 0.0, "probability of playing a random card (exploration)")
 	rolloutEpsilon  := flag.Float64("rollout-epsilon", 0.0, "probability of random card in rollout strategies")
+	topK            := flag.Int("top-k", 0, "pre-screen candidates with model, run rollouts on top K only (0=all)")
 	flag.Parse()
+
+	var stopNow atomic.Bool
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-sigCh
+		stopNow.Store(true)
+	}()
 
 	var baseModel *ml.MLP
 	if *modelPath != "" {
@@ -159,8 +171,15 @@ func main() {
 			}
 
 			for i := 0; i < perWorker; i++ {
+				if stopNow.Load() && totalHands.Load() >= int64(*floor) {
+					break
+				}
 				handID := wid*perWorker + i
-				rows := ml.CollectHand(handID, gs, strats, rolloutStrats, rng, *rollouts)
+				rows := ml.CollectHand(handID, gs, strats, rolloutStrats, rng, ml.CollectOpts{
+					Rollouts: *rollouts,
+					TopK:     *topK,
+					Screener: baseModel,
+				})
 				if len(rows) > 0 {
 					rowCh <- rows
 				}
@@ -208,8 +227,16 @@ func (s *epsilonStrategy) ChooseTrump(seat int, hand []card.Card) card.Suit { re
 func (s *epsilonStrategy) GivePepper(seat int, hand []card.Card, trump card.Suit) card.Card { return s.inner.GivePepper(seat, hand, trump) }
 func (s *epsilonStrategy) PepperDiscard(seat int, hand []card.Card, trump card.Suit, received [2]card.Card) [2]card.Card { return s.inner.PepperDiscard(seat, hand, trump, received) }
 func (s *epsilonStrategy) Play(seat int, validPlays []card.Card, state *game.TrickState) card.Card {
-	if len(validPlays) > 1 && s.rng.Float64() < s.epsilon {
-		return validPlays[s.rng.Intn(len(validPlays))]
+	if len(validPlays) > 1 {
+		// Scale epsilon by move count so each alternative gets roughly equal
+		// exploration coverage regardless of hand size (baseline = 2 choices).
+		eff := s.epsilon * float64(len(validPlays)) / 2.0
+		if eff > 0.9 {
+			eff = 0.9
+		}
+		if s.rng.Float64() < eff {
+			return validPlays[s.rng.Intn(len(validPlays))]
+		}
 	}
 	return s.inner.Play(seat, validPlays, state)
 }

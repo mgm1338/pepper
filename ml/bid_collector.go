@@ -201,6 +201,7 @@ func (dp *bidPoint) playHand(
 	// Get a pooled HandHistory — avoids heap escape through TrickState.History interface call.
 	history := historyPool.Get().(*game.HandHistory)
 	history.Reset()
+	history.SetTrump(trump)
 
 	trick := trickPool.Get().(*game.Trick)
 	trick.Reset(leader, trump)
@@ -245,6 +246,41 @@ func (dp *bidPoint) playHand(
 	return result.ScoreDelta[game.TeamOf(dp.seat)]
 }
 
+// BidCollectOpts configures data-collection behaviour for CollectBidHand.
+type BidCollectOpts struct {
+	Rollouts int
+	TopK     int
+	Screener *BidMLP
+}
+
+// screenBidTopK scores each bid level with m and writes the top k into dst[:k].
+// dst must have cap >= k; the caller typically passes a stack-allocated [8]int.
+func screenBidTopK(m *BidMLP, validBids []int, ctx [BidContextLen]float32, currentHigh int, k int, dst []int) []int {
+	type bs struct {
+		bid int
+		v   float32
+	}
+	var buf [8]bs
+	for i, b := range validBids {
+		buf[i] = bs{b, m.Score(AppendBidAction(ctx, b, currentHigh))}
+	}
+	scored := buf[:len(validBids)]
+	for i := 0; i < k; i++ {
+		best := i
+		for j := i + 1; j < len(scored); j++ {
+			if scored[j].v > scored[best].v {
+				best = j
+			}
+		}
+		scored[i], scored[best] = scored[best], scored[i]
+	}
+	dst = dst[:k]
+	for i := 0; i < k; i++ {
+		dst[i] = scored[i].bid
+	}
+	return dst
+}
+
 // CollectBidHand runs one complete hand, intercepting each bid decision and
 // evaluating each valid bid option via counterfactual rollouts.
 func CollectBidHand(
@@ -253,7 +289,7 @@ func CollectBidHand(
 	strategies [6]game.Strategy,
 	rolloutStrat [6]game.Strategy,
 	rng *rand.Rand,
-	rollouts int,
+	opts BidCollectOpts,
 ) []BidCollectRow {
 	dealBuf := dealBufPool.Get().(*card.DealBuf)
 	hands := card.DealInto(dealBuf, rng)
@@ -268,6 +304,7 @@ func CollectBidHand(
 	rows := bidRowsBufPool.Get().([]BidCollectRow)[:0]
 
 	var seatsLeft [6]int
+	var topKBidBuf [8]int
 	rolloutValidBufPtr := validCardBufPool.Get().(*[]card.Card)
 	rolloutValidBuf := (*rolloutValidBufPtr)[:0]
 	defer func() { *rolloutValidBufPtr = rolloutValidBuf[:0]; validCardBufPool.Put(rolloutValidBufPtr) }()
@@ -322,19 +359,25 @@ func CollectBidHand(
 		ctx := BidContext(seat, hands[seat], dealer, currentHigh, highSeat, nSeatsLeft, scores, passesSoFar, anyPartnerBid, partnerBidLevel, seatBidLevel)
 
 		validBids := ValidBidLevels(currentHigh)
-		for _, bidLevel := range validBids {
-			var total float64
-			for r := 0; r < rollouts; r++ {
-				total += float64(dp.rollout(bidLevel, &hands, &rolloutStrat, rng, &rolloutValidBuf))
+		if len(validBids) > 1 {
+			bidCandidates := validBids
+			if opts.TopK > 0 && opts.Screener != nil && len(validBids) > opts.TopK {
+				bidCandidates = screenBidTopK(opts.Screener, validBids, ctx, currentHigh, opts.TopK, topKBidBuf[:])
 			}
-			avgDelta := total / float64(rollouts)
-			rows = append(rows, BidCollectRow{
-				HandID:     handID,
-				Seat:       seat,
-				BidLevel:   bidLevel,
-				Features:   AppendBidAction(ctx, bidLevel, currentHigh),
-				ScoreDelta: float32(avgDelta),
-			})
+			for _, bidLevel := range bidCandidates {
+				var total float64
+				for r := 0; r < opts.Rollouts; r++ {
+					total += float64(dp.rollout(bidLevel, &hands, &rolloutStrat, rng, &rolloutValidBuf))
+				}
+				avgDelta := total / float64(opts.Rollouts)
+				rows = append(rows, BidCollectRow{
+					HandID:     handID,
+					Seat:       seat,
+					BidLevel:   bidLevel,
+					Features:   AppendBidAction(ctx, bidLevel, currentHigh),
+					ScoreDelta: float32(avgDelta),
+				})
+			}
 		}
 
 		// Advance bidding state using the base strategy's actual decision.
